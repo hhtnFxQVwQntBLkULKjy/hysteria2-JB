@@ -175,6 +175,148 @@ get_letsencrypt_cert() {
     fi
 }
 
+# 自动检测证书路径
+auto_detect_cert() {
+    local domain=$1
+    
+    # 常见的证书路径
+    local cert_paths=(
+        "/etc/letsencrypt/live/${domain}/fullchain.pem"
+        "/etc/letsencrypt/live/${domain}/cert.pem"
+        "/etc/ssl/certs/${domain}.crt"
+        "/etc/ssl/certs/${domain}.pem"
+        "/etc/nginx/ssl/${domain}.crt"
+        "/etc/nginx/ssl/${domain}.pem"
+        "/etc/apache2/ssl/${domain}.crt"
+        "/etc/apache2/ssl/${domain}.pem"
+        "/opt/ssl/${domain}.crt"
+        "/opt/ssl/${domain}.pem"
+        "/usr/local/nginx/conf/ssl/${domain}.crt"
+        "/usr/local/nginx/conf/ssl/${domain}.pem"
+        "/www/server/panel/vhost/cert/${domain}/fullchain.pem"
+        "/www/server/panel/vhost/cert/${domain}/cert.pem"
+        "~/.acme.sh/${domain}_ecc/fullchain.cer"
+        "~/.acme.sh/${domain}/fullchain.cer"
+        "/root/.acme.sh/${domain}_ecc/fullchain.cer"
+        "/root/.acme.sh/${domain}/fullchain.cer"
+    )
+    
+    local key_paths=(
+        "/etc/letsencrypt/live/${domain}/privkey.pem"
+        "/etc/ssl/private/${domain}.key"
+        "/etc/nginx/ssl/${domain}.key"
+        "/etc/apache2/ssl/${domain}.key"
+        "/opt/ssl/${domain}.key"
+        "/usr/local/nginx/conf/ssl/${domain}.key"
+        "/www/server/panel/vhost/cert/${domain}/privkey.pem"
+        "~/.acme.sh/${domain}_ecc/${domain}.key"
+        "~/.acme.sh/${domain}/${domain}.key"
+        "/root/.acme.sh/${domain}_ecc/${domain}.key"
+        "/root/.acme.sh/${domain}/${domain}.key"
+    )
+    
+    log_info "自动检测域名 ${domain} 的证书路径..."
+    
+    local found_cert=""
+    local found_key=""
+    
+    # 检测证书文件
+    for cert_path in "${cert_paths[@]}"; do
+        # 展开 ~ 路径
+        cert_path=$(eval echo "$cert_path")
+        if [[ -f "$cert_path" ]]; then
+            found_cert="$cert_path"
+            log_info "找到证书文件: $cert_path"
+            break
+        fi
+    done
+    
+    # 检测密钥文件
+    for key_path in "${key_paths[@]}"; do
+        # 展开 ~ 路径
+        key_path=$(eval echo "$key_path")
+        if [[ -f "$key_path" ]]; then
+            found_key="$key_path"
+            log_info "找到密钥文件: $key_path"
+            break
+        fi
+    done
+    
+    # 检查是否找到了证书和密钥
+    if [[ -n "$found_cert" ]] && [[ -n "$found_key" ]]; then
+        log_info "自动检测到证书，使用现有证书文件"
+        use_custom_cert "$found_cert" "$found_key"
+        return 0
+    else
+        log_warn "未找到现有证书文件"
+        return 1
+    fi
+}
+
+# 自动检测所有可能的证书
+auto_detect_any_cert() {
+    log_info "自动检测系统中的证书文件..."
+    
+    # 通用证书路径（不依赖域名）
+    local common_cert_paths=(
+        "/etc/letsencrypt/live/*/fullchain.pem"
+        "/etc/letsencrypt/live/*/cert.pem"
+        "/etc/ssl/certs/*.crt"
+        "/etc/ssl/certs/*.pem"
+        "/etc/nginx/ssl/*.crt"
+        "/etc/nginx/ssl/*.pem"
+        "/etc/apache2/ssl/*.crt"
+        "/etc/apache2/ssl/*.pem"
+        "/opt/ssl/*.crt"
+        "/opt/ssl/*.pem"
+        "/www/server/panel/vhost/cert/*/fullchain.pem"
+        "/root/.acme.sh/*/fullchain.cer"
+        "/root/.acme.sh/*_ecc/fullchain.cer"
+    )
+    
+    local found_cert=""
+    local found_key=""
+    
+    # 搜索证书文件
+    for pattern in "${common_cert_paths[@]}"; do
+        for cert_file in $pattern; do
+            if [[ -f "$cert_file" ]]; then
+                # 尝试找到对应的密钥文件
+                local dir=$(dirname "$cert_file")
+                local basename=$(basename "$cert_file")
+                
+                # 可能的密钥文件名
+                local key_patterns=(
+                    "${dir}/privkey.pem"
+                    "${dir}/private.key"
+                    "${dir}/*.key"
+                    "${dir}/${basename%.*}.key"
+                )
+                
+                for key_pattern in "${key_patterns[@]}"; do
+                    for key_file in $key_pattern; do
+                        if [[ -f "$key_file" ]]; then
+                            found_cert="$cert_file"
+                            found_key="$key_file"
+                            log_info "找到证书对: $cert_file, $key_file"
+                            break 3
+                        fi
+                    done
+                done
+            fi
+        done
+    done
+    
+    if [[ -n "$found_cert" ]] && [[ -n "$found_key" ]]; then
+        log_info "自动检测到证书，使用现有证书文件"
+        use_custom_cert "$found_cert" "$found_key"
+        return 0
+    else
+        log_warn "未找到任何可用的证书文件"
+        return 1
+    fi
+}
+
 # 使用用户提供的证书
 use_custom_cert() {
     local cert_path=$1
@@ -221,9 +363,25 @@ setup_certificate() {
             fi
             use_custom_cert "$cert_path" "$key_path"
             ;;
+        "auto")
+            # 自动检测模式
+            if [[ -n "$domain" ]]; then
+                # 如果提供了域名，先尝试检测该域名的证书
+                if ! auto_detect_cert "$domain"; then
+                    log_info "未找到域名 $domain 的证书，尝试申请 Let's Encrypt 证书..."
+                    get_letsencrypt_cert "$domain"
+                fi
+            else
+                # 没有提供域名，尝试检测任何可用的证书
+                if ! auto_detect_any_cert; then
+                    log_error "未找到任何可用的证书，请指定域名以申请 Let's Encrypt 证书，或手动指定证书路径"
+                    exit 1
+                fi
+            fi
+            ;;
         *)
             log_error "不支持的证书类型: $cert_type"
-            log_info "支持的类型: letsencrypt, custom"
+            log_info "支持的类型: letsencrypt, custom, auto"
             exit 1
             ;;
     esac
@@ -411,21 +569,35 @@ show_usage() {
     echo "  $0 [选项] [端口]"
     echo
     echo "选项:"
-    echo "  -t, --cert-type TYPE     证书类型 (letsencrypt|custom)"
-    echo "  -d, --domain DOMAIN      域名 (用于 Let's Encrypt)"
+    echo "  -t, --cert-type TYPE     证书类型 (letsencrypt|custom|auto)"
+    echo "  -d, --domain DOMAIN      域名 (用于 Let's Encrypt 或自动检测)"
     echo "  -c, --cert-file FILE     证书文件路径 (用于自定义证书)"
     echo "  -k, --key-file FILE      密钥文件路径 (用于自定义证书)"
     echo "  -p, --port PORT          端口号 (默认: 8443)"
     echo "  -h, --help               显示帮助信息"
     echo
+    echo "证书类型说明:"
+    echo "  letsencrypt             申请 Let's Encrypt 免费证书"
+    echo "  custom                  使用指定的证书文件"
+    echo "  auto                    自动检测现有证书或申请新证书"
+    echo
     echo "示例:"
+    echo "  # 自动检测证书（推荐）"
+    echo "  $0 -t auto -d example.com"
+    echo
     echo "  # 使用 Let's Encrypt 证书"
     echo "  $0 -t letsencrypt -d example.com -p 8443"
     echo
     echo "  # 使用自定义证书"
     echo "  $0 -t custom -c /path/to/cert.pem -k /path/to/key.pem -p 8443"
     echo
+    echo "  # 自动检测任何可用证书（无域名）"
+    echo "  $0 -t auto"
+    echo
     echo "一键安装命令:"
+    echo "  # 自动模式（推荐）"
+    echo "  bash <(curl -fsSL https://raw.githubusercontent.com/username/repo/main/install.sh) -t auto -d your-domain.com"
+    echo
     echo "  # Let's Encrypt 证书"
     echo "  bash <(curl -fsSL https://raw.githubusercontent.com/username/repo/main/install.sh) -t letsencrypt -d your-domain.com"
     echo
@@ -435,7 +607,7 @@ show_usage() {
 
 # 解析命令行参数
 parse_args() {
-    CERT_TYPE=""
+    CERT_TYPE="auto"  # 默认使用自动检测
     DOMAIN=""
     CERT_FILE=""
     KEY_FILE=""
@@ -487,12 +659,6 @@ parse_args() {
     done
     
     # 验证参数
-    if [[ -z "$CERT_TYPE" ]]; then
-        log_error "请指定证书类型 (-t letsencrypt 或 -t custom)"
-        show_usage
-        exit 1
-    fi
-    
     if [[ "$CERT_TYPE" == "letsencrypt" ]] && [[ -z "$DOMAIN" ]]; then
         log_error "使用 Let's Encrypt 需要指定域名 (-d domain.com)"
         show_usage

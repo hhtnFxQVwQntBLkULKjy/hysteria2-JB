@@ -121,13 +121,77 @@ get_user_input() {
     fi
 }
 
+# 等待dpkg锁释放
+wait_for_dpkg_lock() {
+    print_info "检查dpkg锁..."
+    local max_attempts=30
+    local attempt=1
+    local wait_time=10
+
+    # 预先停止所有apt相关服务和定时器
+    print_info "停止apt相关服务和定时器..."
+    systemctl stop apt-daily.timer apt-daily-upgrade.timer unattended-upgrades >/dev/null 2>&1 || true
+    pkill -9 apt apt-get dpkg >/dev/null 2>&1 || true
+
+    # 检查文件系统是否可写
+    if mount | grep -q '/.*ro,'; then
+        print_error "文件系统为只读状态，尝试重新挂载为读写..."
+        mount -o remount,rw / >/dev/null 2>&1 || {
+            print_error "无法重新挂载文件系统为读写，请手动运行 'sudo mount -o remount,rw /' 后重试。"
+            exit 1
+        }
+    fi
+
+    while [[ -f /var/lib/dpkg/lock-frontend ]]; do
+        lock_holder=$(lsof /var/lib/dpkg/lock-frontend 2>/dev/null | awk 'NR>1 {print $2}' | sort -u)
+        if [[ -n "$lock_holder" ]]; then
+            print_error "dpkg锁被以下进程占用："
+            ps -p $lock_holder -o pid,comm
+            if [[ $attempt -gt $max_attempts ]]; then
+                print_error "无法获取dpkg锁，建议手动检查以下进程："
+                ps aux | grep -E 'apt|dpkg|unattended' | grep -v grep
+                print_error "请终止进程（例如：sudo kill -9 <PID>）或等待其完成，然后重试。"
+                exit 1
+            fi
+            print_warn "dpkg锁被占用，等待${wait_time}秒 (尝试 ${attempt}/${max_attempts})..."
+            sleep $wait_time
+            ((attempt++))
+        else
+            print_warn "未找到占用锁的进程，尝试清理锁文件..."
+            rm -f /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock /var/lib/apt/lists/lock 2>/dev/null || {
+                print_error "无法删除锁文件，请检查权限或文件系统状态："
+                ls -l /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock /var/lib/apt/lists/lock 2>/dev/null
+                print_error "手动运行以下命令后重试："
+                print_error "sudo rm -f /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock /var/lib/apt/lists/lock"
+                print_error "sudo dpkg --configure -a"
+                exit 1
+            }
+            dpkg --configure -a >/dev/null 2>&1
+            if [[ -f /var/lib/dpkg/lock-frontend ]]; then
+                print_error "锁文件清理失败，请手动运行以下命令后重试："
+                print_error "sudo rm -f /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock /var/lib/apt/lists/lock"
+                print_error "sudo dpkg --configure -a"
+                exit 1
+            fi
+            break
+        fi
+    done
+
+    # 确保apt系统一致
+    dpkg --configure -a >/dev/null 2>&1
+    print_ok "dpkg锁已释放，继续执行..."
+}
+
 # 安装依赖
 install_dependencies() {
     print_info "安装系统依赖..."
     
     if [[ "$OS" == "debian" ]]; then
+        wait_for_dpkg_lock
         apt update -y
         apt install -y curl wget socat cron openssl uuid-runtime
+        # 恢复apt定时任务
+        systemctl start apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
     else
         yum update -y
         yum install -y curl wget socat crontabs openssl util-linux
@@ -239,7 +303,7 @@ setup_certificate() {
     fi
     
     # 自动设置证书文件权限（假设 Hysteria2 以 hysteria 用户运行）
-    chown hysteria:hysteria /etc/hysteria/private.key /etc/hysteria/cert.crt || true  # 使用 || true 以防用户不存在
+    chown hysteria:hysteria /etc/hysteria/private.key /etc/hysteria/cert.crt || true
     chmod 600 /etc/hysteria/private.key
     chmod 644 /etc/hysteria/cert.crt
 
@@ -481,9 +545,9 @@ main() {
     get_server_ip
     get_user_input
     install_dependencies
+    install_hysteria2
     setup_firewall
     setup_certificate
-    install_hysteria2
     generate_config
     start_service
     show_result

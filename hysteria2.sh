@@ -186,6 +186,15 @@ setup_firewall() {
             print_ok "iptables防火墙已配置"
         fi
     fi
+
+    # 检查 SELinux/AppArmor
+    if command -v sestatus >/dev/null 2>&1 && sestatus | grep -q "SELinux status:.*enabled"; then
+        print_info "检测到SELinux启用，调整上下文..."
+        chcon -R -t hysteria_data_t /etc/hysteria/ || chcon -R -t default_t /etc/hysteria/
+    fi
+    if command -v aa-status >/dev/null 2>&1 && aa-status | grep -q "hysteria"; then
+        print_info "检测到AppArmor启用，建议检查配置文件"
+    fi
 }
 
 # 安装证书
@@ -229,8 +238,16 @@ setup_certificate() {
         print_ok "自签名证书生成完成"
     fi
     
+    # 自动设置证书文件权限（假设 Hysteria2 以 hysteria 用户运行）
+    chown hysteria:hysteria /etc/hysteria/private.key /etc/hysteria/cert.crt || true  # 使用 || true 以防用户不存在
     chmod 600 /etc/hysteria/private.key
     chmod 644 /etc/hysteria/cert.crt
+
+    # 验证证书文件
+    if ! openssl x509 -in /etc/hysteria/cert.crt -noout 2>/dev/null || ! openssl rsa -in /etc/hysteria/private.key -check 2>/dev/null; then
+        print_error "证书文件无效，请检查"
+        exit 1
+    fi
 }
 
 # 安装Hysteria2
@@ -374,7 +391,9 @@ start_service() {
         print_ok "Hysteria2服务启动成功"
     else
         print_error "Hysteria2服务启动失败"
-        print_error "错误日志: $(journalctl -u hysteria-server --no-pager -n 10)"
+        print_error "错误日志如下："
+        journalctl -u hysteria-server --no-pager -n 50
+        print_error "请检查 /etc/hysteria/config.yaml 和证书文件权限"
         exit 1
     fi
 }

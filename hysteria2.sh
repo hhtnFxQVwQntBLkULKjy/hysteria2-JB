@@ -1,439 +1,299 @@
 #!/bin/bash
 
-# Hysteria2 自动安装/更新脚本
-# 支持 Ubuntu/Debian/CentOS 系统
+#================================================================================
+# Hysteria 2 安装与管理脚本
+#
+# Author: Gemini
+# Version: 1.1.0
+#
+# 功能:
+#   - 交互式安装与配置 Hysteria 2
+#   - 自动安装依赖、申请 SSL 证书 (acme.sh)
+#   - 自动配置防火墙 (ufw, firewalld)
+#   - 设置 systemd 服务
+#   - 生成客户端分享链接
+#   - 提供完整的卸载功能
+#================================================================================
 
-set -e
+# --- 全局变量与颜色定义 ---
+RESET="\033[0m"
+BOLD="\033[1m"
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+BLUE="\033[34m"
 
-# ==================== 配置区域 ====================
-# 请在这里修改你的配置
+HYSTERIA_CONFIG_PATH="/etc/hysteria/config.yaml"
+HYSTERIA_OFFICIAL_INSTALLER_URL="https://get.hy2.sh/"
+ACME_SH_INSTALLER_URL="https://get.acme.sh"
 
-# 基础配置
-LISTEN_PORT="443"                    # 监听端口
-DOMAIN="your-domain.com"             # 你的域名
-EMAIL="your-email@example.com"       # 邮箱地址（用于申请证书）
-
-# 认证配置
-AUTH_TYPE="password"                 # 认证类型: password 或 userpass
-AUTH_PASSWORD="your-password"        # 密码认证的密码
-# 如果使用 userpass 认证，在下面添加用户
-declare -A USERS=(
-    ["user1"]="password1"
-    ["user2"]="password2"
-)
-
-# 高级配置
-MASQUERADE_TYPE="proxy"              # 伪装类型: file, proxy, string
-MASQUERADE_PROXY="https://www.bing.com/"  # 代理伪装地址
-MASQUERADE_STRING="Not Found"        # 字符串伪装内容
-MASQUERADE_FILE="/var/www/html"      # 文件伪装目录
-
-# 网络配置
-BANDWIDTH_UP="1gbps"                 # 上行带宽限制
-BANDWIDTH_DOWN="1gbps"               # 下行带宽限制
-UDP_HOP_INTERVAL="30s"               # UDP 端口跳跃间隔
-
-# TLS 配置
-TLS_CERT_PATH="/etc/hysteria/server.crt"
-TLS_KEY_PATH="/etc/hysteria/server.key"
-
-# 自动更新配置
-AUTO_UPDATE="true"                   # 是否启用自动更新检查
-UPDATE_CHECK_INTERVAL="weekly"       # 更新检查间隔: daily, weekly, monthly
-
-# ==================== 脚本开始 ====================
-
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
-
-# 日志函数
-log_info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
+# --- 辅助函数 ---
+log() {
+    echo -e "${BLUE}[信息]${RESET} $1"
 }
 
-log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
+warn() {
+    echo -e "${YELLOW}[警告]${RESET} $1"
 }
 
-log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+error() {
+    echo -e "${RED}[错误]${RESET} $1" >&2
+    exit 1
 }
 
-# 显示使用方法
-show_usage() {
-    echo -e "${BLUE}Hysteria2 管理脚本${NC}"
-    echo "使用方法: $0 [选项]"
-    echo ""
-    echo "选项:"
-    echo "  install    - 安装 Hysteria2"
-    echo "  update     - 更新 Hysteria2 到最新版本"
-    echo "  uninstall  - 卸载 Hysteria2"
-    echo "  status     - 显示服务状态"
-    echo "  restart    - 重启服务"
-    echo "  logs       - 显示日志"
-    echo "  config     - 显示客户端配置"
-    echo "  version    - 显示版本信息"
-    echo "  check      - 检查更新"
-    echo ""
-}
-
-# 检查是否为 root 用户
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        log_error "此脚本需要 root 权限运行"
-        exit 1
-    fi
-}
-
-# 检测系统类型
-detect_system() {
-    if [[ -f /etc/redhat-release ]]; then
-        OS="centos"
-        PACKAGE_MANAGER="yum"
-    elif [[ -f /etc/debian_version ]]; then
-        OS="debian"
-        PACKAGE_MANAGER="apt"
-    else
-        log_error "不支持的操作系统"
-        exit 1
-    fi
-    log_info "检测到系统: $OS"
-}
-
-# 获取架构信息
-get_architecture() {
-    ARCH=$(uname -m)
-    case $ARCH in
-        x86_64)
-            ARCH="amd64"
-            ;;
-        aarch64)
-            ARCH="arm64"
-            ;;
-        armv7l)
-            ARCH="armv7"
+confirm() {
+    read -rp "$1 [y/N]: " response
+    case "$response" in
+        [yY][eE][sS]|[yY])
+            return 0
             ;;
         *)
-            log_error "不支持的架构: $ARCH"
-            exit 1
+            return 1
             ;;
     esac
 }
 
-# 获取最新版本信息
-get_latest_version() {
-    log_info "获取最新版本信息..."
-    LATEST_VERSION=$(curl -s https://api.github.com/repos/apernet/hysteria/releases/latest | grep '"tag_name"' | cut -d'"' -f4)
-    if [[ -z "$LATEST_VERSION" ]]; then
-        log_error "无法获取最新版本信息"
-        exit 1
+# --- 环境检查函数 ---
+check_root() {
+    if [[ "$EUID" -ne 0 ]]; then
+        error "此脚本必须以 root 权限运行。请使用 'sudo' 执行。"
     fi
-    log_info "最新版本: $LATEST_VERSION"
 }
 
-# 获取当前安装的版本
-get_current_version() {
-    if [[ -f /usr/local/bin/hysteria ]]; then
-        CURRENT_VERSION=$(/usr/local/bin/hysteria version 2>/dev/null | grep -o "app/[^ ]*" | cut -d'/' -f2 | cut -d'@' -f1)
-        if [[ -z "$CURRENT_VERSION" ]]; then
-            CURRENT_VERSION="unknown"
+check_system() {
+    if ! command -v systemctl &> /dev/null; then
+        error "未检测到 systemd。此脚本目前仅支持基于 systemd 的系统。"
+    fi
+    log "检测到 systemd，检查通过。"
+}
+
+check_dependencies() {
+    local deps=("curl" "wget" "jq" "socat")
+    local missing_deps=()
+    log "正在检查所需依赖..."
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &> /dev/null; then
+            missing_deps+=("$dep")
         fi
-    else
-        CURRENT_VERSION="not installed"
-    fi
-}
+    done
 
-# 检查是否需要更新
-check_update_needed() {
-    get_current_version
-    get_latest_version
-    
-    if [[ "$CURRENT_VERSION" == "not installed" ]]; then
-        log_info "Hysteria2 未安装"
-        return 0
-    elif [[ "$CURRENT_VERSION" == "unknown" ]]; then
-        log_warn "无法确定当前版本，建议更新"
-        return 0
-    elif [[ "$CURRENT_VERSION" != "$LATEST_VERSION" ]]; then
-        log_info "发现新版本: $CURRENT_VERSION -> $LATEST_VERSION"
-        return 0
-    else
-        log_info "已是最新版本: $CURRENT_VERSION"
-        return 1
-    fi
-}
-
-# 下载 Hysteria2
-download_hysteria2() {
-    local version=${1:-$LATEST_VERSION}
-    
-    log_info "下载 Hysteria2 $version..."
-    
-    # 创建临时目录
-    TMP_DIR=$(mktemp -d)
-    cd $TMP_DIR
-    
-    get_architecture
-    
-    # 构建下载URL
-    DOWNLOAD_URL="https://github.com/apernet/hysteria/releases/download/${version}/hysteria-linux-${ARCH}"
-    
-    # 下载文件
-    if ! wget -O hysteria "$DOWNLOAD_URL"; then
-        log_error "下载失败"
-        cd /
-        rm -rf $TMP_DIR
-        exit 1
-    fi
-    
-    # 验证下载的文件
-    if [[ ! -f hysteria ]] || [[ ! -s hysteria ]]; then
-        log_error "下载的文件无效"
-        cd /
-        rm -rf $TMP_DIR
-        exit 1
-    fi
-    
-    chmod +x hysteria
-}
-
-# 安装/更新 Hysteria2 二进制文件
-install_binary() {
-    log_info "安装 Hysteria2 二进制文件..."
-    
-    # 如果服务正在运行，先停止
-    if systemctl is-active --quiet hysteria-server 2>/dev/null; then
-        log_info "停止 Hysteria2 服务..."
-        systemctl stop hysteria-server
-        SERVICE_WAS_RUNNING=true
-    fi
-    
-    # 备份旧版本
-    if [[ -f /usr/local/bin/hysteria ]]; then
-        cp /usr/local/bin/hysteria /usr/local/bin/hysteria.backup
-        log_info "已备份旧版本到 /usr/local/bin/hysteria.backup"
-    fi
-    
-    # 安装新版本
-    mv hysteria /usr/local/bin/
-    
-    # 创建用户（如果不存在）
-    if ! id "hysteria" &>/dev/null; then
-        useradd -r -s /bin/false hysteria
-    fi
-    
-    # 清理临时文件
-    cd /
-    rm -rf $TMP_DIR
-    
-    # 重新启动服务
-    if [[ "$SERVICE_WAS_RUNNING" == "true" ]]; then
-        log_info "重新启动 Hysteria2 服务..."
-        systemctl start hysteria-server
-    fi
-}
-
-# 安装依赖
-install_dependencies() {
-    log_info "安装系统依赖..."
-    
-    if [[ $OS == "centos" ]]; then
-        $PACKAGE_MANAGER update -y
-        $PACKAGE_MANAGER install -y curl wget unzip socat cron
-        $PACKAGE_MANAGER install -y epel-release
-    else
-        $PACKAGE_MANAGER update -y
-        $PACKAGE_MANAGER install -y curl wget unzip socat cron
-    fi
-}
-
-# 安装 acme.sh
-install_acme() {
-    if [[ ! -f ~/.acme.sh/acme.sh ]]; then
-        log_info "安装 acme.sh..."
-        curl https://get.acme.sh | sh -s email=$EMAIL
-        source ~/.bashrc
-    else
-        log_info "acme.sh 已安装"
-    fi
-}
-
-# 申请 SSL 证书
-issue_certificate() {
-    log_info "申请 SSL 证书..."
-    
-    mkdir -p /etc/hysteria
-    
-    ~/.acme.sh/acme.sh --issue -d $DOMAIN --standalone
-    
-    ~/.acme.sh/acme.sh --installcert -d $DOMAIN \
-        --key-file $TLS_KEY_PATH \
-        --fullchain-file $TLS_CERT_PATH \
-        --reloadcmd "systemctl restart hysteria-server"
+    if [ ${#missing_deps[@]} -gt 0 ]; then
+        warn "缺失以下依赖: ${missing_deps[*]}。正在尝试自动安装..."
+        # 使用 /etc/os-release 文件判断发行版
+        if [ -f /etc/os-release ]; then
+            source /etc/os-release
+            case "$ID" in
+                ubuntu|debian)
+                    apt-get update && apt-get install -y "${missing_deps[@]}"
+                    ;;
+                centos|rocky|almalinux|fedora)
+                    dnf install -y "${missing_deps[@]}"
+                    ;;
+                *)
+                    error "不支持的 Linux 发行版: $ID。请手动安装缺失的依赖后重试。"
+                    ;;
+            esac
+        else
+            error "无法确定 Linux 发行版。请手动安装缺失的依赖后重试。"
+        fi
         
-    chmod 600 $TLS_KEY_PATH
-    chmod 644 $TLS_CERT_PATH
+        # 再次检查
+        for dep in "${missing_deps[@]}"; do
+            if ! command -v "$dep" &> /dev/null; then
+                 error "依赖 '$dep' 自动安装失败。请手动安装后重试。"
+            fi
+        done
+    fi
+    log "所有依赖均已满足。"
 }
 
-# 生成配置文件
-generate_config() {
-    log_info "生成配置文件..."
+# --- 核心功能函数 ---
+
+install_acme() {
+    if [ ! -f "$HOME/.acme.sh/acme.sh" ]; then
+        log "正在安装 acme.sh..."
+        curl "${ACME_SH_INSTALLER_URL}" | sh -s email=my@example.com
+        if [ $? -ne 0 ]; then
+            error "acme.sh 安装失败。"
+        fi
+        log "acme.sh 安装成功。"
+    else
+        log "acme.sh 已安装。"
+    fi
+    # shellcheck source=/root/.acme.sh/acme.sh.env
+    source "$HOME/.acme.sh/acme.sh.env"
+}
+
+issue_certificate() {
+    local domain="$1"
+    local public_ip
+    public_ip=$(curl -s4 http://ipv4.icanhazip.com)
+
+    log "您的公网 IPv4 地址是: ${BOLD}$public_ip${RESET}"
+    log "请确保您的域名 '${BOLD}$domain${RESET}' 已正确解析到此 IP 地址。"
+    if ! confirm "确认域名解析正确并继续吗?"; then
+        error "用户中止了证书申请流程。"
+    fi
+
+    log "正在为 '$domain' 申请证书 (使用 standalone 模式, 需占用 80 端口)..."
+    if [ -f "$HOME/.acme.sh/${domain}_ecc/fullchain.cer" ]; then
+        log "域名 '$domain' 的证书已存在，跳过申请。"
+        return
+    fi
     
-    cat > /etc/hysteria/config.yaml << EOF
-listen: :$LISTEN_PORT
+    # 检查 80 端口是否被占用
+    if lsof -i :80 &>/dev/null; then
+        error "80 端口已被占用。无法使用 standalone 模式申请证书。请先停止占用 80 端口的程序再重试。"
+    fi
+    
+    "$HOME/.acme.sh/acme.sh" --issue -d "$domain" --standalone -k ec-256
+    if [ $? -ne 0 ]; then
+        error "为 '$domain' 申请证书失败。"
+    fi
+
+    log "域名 '$domain' 的证书申请成功。"
+}
+
+install_hysteria() {
+    log "正在运行 Hysteria 2 官方安装脚本..."
+    bash <(curl -fsSL "${HYSTERIA_OFFICIAL_INSTALLER_URL}")
+    if [ $? -ne 0 ]; then
+        error "Hysteria 2 核心程序安装失败。"
+    fi
+    log "Hysteria 2 核心程序安装成功。"
+}
+
+configure_hysteria() {
+    log "开始交互式配置..."
+    
+    local domain port password masquerade_url
+    
+    read -rp "请输入您的域名 (例如: your.domain.com): " domain
+    [ -z "$domain" ] && error "域名不能为空。"
+
+    read -rp "请输入 Hysteria 2 使用的端口 [1-65535] (默认: 443): " port
+    port=${port:-443}
+
+    read -rp "请输入认证密码 (留空则生成随机密码): " password
+    if [ -z "$password" ]; then
+        password=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 16)
+        log "已生成随机密码: ${BOLD}$password${RESET}"
+    fi
+
+    read -rp "请输入伪装网址 (默认: https://bing.com): " masquerade_url
+    masquerade_url=${masquerade_url:-"https://bing.com"}
+
+    # 申请证书
+    install_acme
+    issue_certificate "$domain"
+
+    # 创建配置文件
+    log "正在创建 Hysteria 2 配置文件于 ${HYSTERIA_CONFIG_PATH}..."
+    
+    local cert_path="$HOME/.acme.sh/${domain}_ecc/fullchain.cer"
+    local key_path="$HOME/.acme.sh/${domain}_ecc/${domain}.key"
+
+    mkdir -p "$(dirname "$HYSTERIA_CONFIG_PATH")"
+    
+    cat > "$HYSTERIA_CONFIG_PATH" << EOF
+# 由 Hysteria 2 安装脚本生成
+listen: :${port}
 
 tls:
-  cert: $TLS_CERT_PATH
-  key: $TLS_KEY_PATH
+  cert: ${cert_path}
+  key: ${key_path}
 
-EOF
-
-    # 添加认证配置
-    if [[ $AUTH_TYPE == "password" ]]; then
-        cat >> /etc/hysteria/config.yaml << EOF
 auth:
   type: password
-  password: $AUTH_PASSWORD
+  password: ${password}
 
-EOF
-    else
-        cat >> /etc/hysteria/config.yaml << EOF
-auth:
-  type: userpass
-  userpass:
-EOF
-        for user in "${!USERS[@]}"; do
-            echo "    $user: ${USERS[$user]}" >> /etc/hysteria/config.yaml
-        done
-        echo "" >> /etc/hysteria/config.yaml
-    fi
-
-    # 添加伪装配置
-    case $MASQUERADE_TYPE in
-        "proxy")
-            cat >> /etc/hysteria/config.yaml << EOF
 masquerade:
   type: proxy
   proxy:
-    url: $MASQUERADE_PROXY
+    url: ${masquerade_url}
     rewriteHost: true
-
-EOF
-            ;;
-        "file")
-            cat >> /etc/hysteria/config.yaml << EOF
-masquerade:
-  type: file
-  file:
-    dir: $MASQUERADE_FILE
-
-EOF
-            ;;
-        "string")
-            cat >> /etc/hysteria/config.yaml << EOF
-masquerade:
-  type: string
-  string:
-    content: $MASQUERADE_STRING
-    headers:
-      content-type: text/plain
-      custom-stuff: ice-cream-so-good
-
-EOF
-            ;;
-    esac
-
-    # 添加其他配置
-    cat >> /etc/hysteria/config.yaml << EOF
-bandwidth:
-  up: $BANDWIDTH_UP
-  down: $BANDWIDTH_DOWN
-
-udpIdleTimeout: 60s
-udpHopInterval: $UDP_HOP_INTERVAL
-
-ignoreClientBandwidth: false
-disableUDP: false
 EOF
 
-    chmod 644 /etc/hysteria/config.yaml
-    chown hysteria:hysteria /etc/hysteria/config.yaml
+    log "配置文件创建成功。"
+
+    # 配置防火墙
+    configure_firewall "$port"
+
+    # 重启服务
+    log "正在重启 Hysteria 2 服务..."
+    systemctl restart hysteria-server.service
+    systemctl enable hysteria-server.service
+
+    # 检查服务状态
+    sleep 2
+    if systemctl is-active --quiet hysteria-server.service; then
+        log "${GREEN}Hysteria 2 服务已成功启动！${RESET}"
+    else
+        error "Hysteria 2 服务启动失败。请使用 'journalctl -u hysteria-server -n 50 --no-pager' 查看日志。"
+    fi
+
+    # 显示客户端信息
+    local client_uri="hy2://${password}@${domain}:${port}?sni=${domain}"
+    echo -e "\n${BOLD}================ 客户端配置信息 ================${RESET}"
+    echo -e "  ${BOLD}服务器地址:${RESET}\t$domain"
+    echo -e "  ${BOLD}端口:${RESET}\t\t$port"
+    echo -e "  ${BOLD}密码:${RESET}\t\t$password"
+    echo -e "  ${BOLD}SNI:${RESET}\t\t$domain"
+    echo -e "\n${GREEN}${BOLD}  分享链接 (URI):${RESET}"
+    echo -e "  ${YELLOW}${client_uri}${RESET}\n"
+    echo -e "====================================================\n"
 }
 
-# 创建 systemd 服务
-create_systemd_service() {
-    log_info "创建 systemd 服务..."
-    
-    cat > /etc/systemd/system/hysteria-server.service << EOF
-[Unit]
-Description=Hysteria Server
-Documentation=https://hysteria.network
-After=network.target nss-lookup.target
-
-[Service]
-Type=simple
-User=hysteria
-Group=hysteria
-ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config.yaml
-WorkingDirectory=/etc/hysteria
-Environment=HYSTERIA_LOG_LEVEL=info
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-Restart=on-failure
-RestartSec=10
-RestartPreventExitStatus=23
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable hysteria-server
-}
-
-# 配置防火墙
 configure_firewall() {
-    log_info "配置防火墙..."
-    
-    if command -v firewall-cmd &> /dev/null; then
-        firewall-cmd --permanent --add-port=$LISTEN_PORT/tcp
-        firewall-cmd --permanent --add-port=$LISTEN_PORT/udp
+    local port=$1
+    if command -v ufw &> /dev/null && ufw status | grep -q "active"; then
+        log "检测到 ufw，正在开放端口 ${port}/udp..."
+        ufw allow "${port}/udp"
+    elif command -v firewall-cmd &> /dev/null && firewall-cmd --state | grep -q "running"; then
+        log "检测到 firewalld，正在开放端口 ${port}/udp..."
+        firewall-cmd --add-port="${port}/udp" --permanent
         firewall-cmd --reload
-    elif command -v ufw &> /dev/null; then
-        ufw allow $LISTEN_PORT/tcp
-        ufw allow $LISTEN_PORT/udp
-    elif command -v iptables &> /dev/null; then
-        iptables -A INPUT -p tcp --dport $LISTEN_PORT -j ACCEPT
-        iptables -A INPUT -p udp --dport $LISTEN_PORT -j ACCEPT
-        
-        if [[ $OS == "centos" ]]; then
-            service iptables save
-        else
-            iptables-save > /etc/iptables/rules.v4
-        fi
+    else
+        warn "未检测到活动的防火墙 (ufw 或 firewalld)。如果您的服务器有防火墙，请手动开放 UDP 端口 ${port}。"
     fi
 }
 
-# 设置自动更新
-setup_auto_update() {
-    if [[ "$AUTO_UPDATE" == "true" ]]; then
-        log_info "设置自动更新..."
-        
-        # 创建更新脚本
-        cat > /usr/local/bin/hysteria2-update-check.sh << 'EOF'
-#!/bin/bash
-SCRIPT_PATH="/usr/local/bin/hysteria2-manager.sh"
-if [[ -f "$SCRIPT_PATH" ]]; then
-    $SCRIPT_PATH check && $SCRIPT_PATH update
-fi
-EOF
-        chmod +x /usr/local/bin/hysteria2-update-check.sh
-        
-        # 添加 cron 任务
-        case $UPDATE_CHECK_INTERVAL in
-            "daily")
+uninstall_hysteria() {
+    if confirm "${BOLD}${RED}您确定要完全卸载 Hysteria 2 吗？此操作将停止服务并删除相关文件。${RESET}"; then
+        log "正在卸载 Hysteria 2..."
+        bash <(curl -fsSL "${HYSTERIA_OFFICIAL_INSTALLER_URL}") --remove
+        rm -rf /etc/hysteria
+        log "Hysteria 2 已被卸载。"
+        warn "注意: 由 acme.sh 申请的证书尚未移除，您可以手动管理。"
+    else
+        log "卸载操作已取消。"
+    fi
+}
+
+# --- 主逻辑 ---
+main() {
+    if [[ "$1" == "--remove" ]]; then
+        check_root
+        uninstall_hysteria
+        exit 0
+    fi
+
+    clear
+    echo "=================================================="
+    echo "       Hysteria 2 一键安装与管理脚本"
+    echo "=================================================="
+    echo
+
+    check_root
+    check_system
+    check_dependencies
+    
+    install_hysteria
+    configure_hysteria
+
+    echo "=================================================="
+    echo "             安装流程执行完毕"
+    echo "=================================================="
+}
+
+main "$@"

@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Hysteria 2 完整安装脚本 - 修复私钥验证问题
-# 改进私钥格式检查和证书处理
+# Hysteria 2 完整安装脚本 - 添加端口跳跃功能
+# 改进私钥验证和证书处理，新增端口跳跃配置
 
 # 颜色定义
 RED='\033[0;31m'
@@ -25,6 +25,7 @@ CERT_DIR="$HYSTERIA_DIR/certs"
 CONFIG_FILE="$HYSTERIA_DIR/config.yaml"
 SERVICE_FILE="/etc/systemd/system/hysteria2.service"
 HYSTERIA_BINARY="/usr/local/bin/hysteria2"
+IPTABLES_RULES_FILE="/etc/hysteria2/iptables-rules.sh"
 
 # 检查系统
 check_system() {
@@ -48,10 +49,10 @@ check_system() {
     print_info "安装必要工具..."
     if command -v apt-get &> /dev/null; then
         DEBIAN_FRONTEND=noninteractive apt-get update -qq
-        DEBIAN_FRONTEND=noninteractive apt-get install -y curl wget tar socat openssl cron net-tools dnsutils lsof
+        DEBIAN_FRONTEND=noninteractive apt-get install -y curl wget tar socat openssl cron net-tools dnsutils lsof iptables iptables-persistent
     elif command -v yum &> /dev/null; then
         yum update -y -q
-        yum install -y curl wget tar socat openssl crontabs net-tools bind-utils lsof
+        yum install -y curl wget tar socat openssl crontabs net-tools bind-utils lsof iptables-services
     fi
     
     print_success "系统检查完成 ($ARCH)"
@@ -277,7 +278,7 @@ request_certificate() {
     fi
 }
 
-# 修复证书格式函数（新增）
+# 修复证书格式函数
 fix_certificate_format() {
     print_info "修复证书格式..."
     
@@ -304,6 +305,288 @@ fix_certificate_format() {
     chmod 644 "$CERT_DIR/server.crt"
     
     print_success "证书格式修复完成"
+}
+
+# 🆕 配置端口跳跃功能
+setup_port_hopping() {
+    print_step "配置端口跳跃功能..."
+    
+    echo -e "${CYAN}端口跳跃配置选项：${NC}"
+    echo "1) 启用端口跳跃"
+    echo "2) 禁用端口跳跃"
+    echo "3) 查看当前状态"
+    echo ""
+    
+    local hop_choice
+    read -p "请选择 [1-3]: " hop_choice
+    
+    case $hop_choice in
+        1)
+            configure_port_hopping
+            ;;
+        2)
+            disable_port_hopping
+            ;;
+        3)
+            show_port_hopping_status
+            ;;
+        *)
+            print_error "无效选项"
+            return 1
+            ;;
+    esac
+}
+
+# 配置端口跳跃
+configure_port_hopping() {
+    print_info "配置端口跳跃参数..."
+    
+    # 获取网络接口
+    local interface=$(ip route | grep default | awk '{print $5}' | head -1)
+    print_info "检测到网络接口: $interface"
+    
+    # 获取实际监听端口
+    local actual_port="${PORT:-443}"
+    if [[ -f "$CONFIG_FILE" ]]; then
+        actual_port=$(grep "listen:" "$CONFIG_FILE" | awk -F: '{print $NF}' | tr -d ' ')
+    fi
+    
+    # 获取端口跳跃范围
+    local start_port
+    local end_port
+    
+    while true; do
+        read -p "起始端口 (建议 20000): " start_port
+        start_port=${start_port:-20000}
+        if [[ "$start_port" =~ ^[1-9][0-9]{3,4}$ ]] && [[ $start_port -ge 1024 && $start_port -le 65000 ]]; then
+            break
+        fi
+        print_error "端口范围: 1024-65000"
+    done
+    
+    while true; do
+        read -p "结束端口 (建议 40000): " end_port
+        end_port=${end_port:-40000}
+        if [[ "$end_port" =~ ^[1-9][0-9]{3,4}$ ]] && [[ $end_port -gt $start_port && $end_port -le 65535 ]]; then
+            break
+        fi
+        print_error "结束端口必须大于起始端口且不超过65535"
+    done
+    
+    print_info "配置端口跳跃: $start_port-$end_port -> $actual_port"
+    
+    # 创建 iptables 规则脚本
+    mkdir -p "$HYSTERIA_DIR"
+    cat > "$IPTABLES_RULES_FILE" << EOF
+#!/bin/bash
+# Hysteria 2 端口跳跃规则
+
+# 网络接口
+INTERFACE="$interface"
+
+# 实际监听端口
+ACTUAL_PORT=$actual_port
+
+# 端口跳跃范围
+START_PORT=$start_port
+END_PORT=$end_port
+
+# 清理旧规则
+cleanup_rules() {
+    # IPv4
+    iptables -t nat -D PREROUTING -i \$INTERFACE -p udp --dport \$START_PORT:\$END_PORT -j REDIRECT --to-ports \$ACTUAL_PORT 2>/dev/null || true
+    
+    # IPv6 (如果支持)
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -t nat -D PREROUTING -i \$INTERFACE -p udp --dport \$START_PORT:\$END_PORT -j REDIRECT --to-ports \$ACTUAL_PORT 2>/dev/null || true
+    fi
+}
+
+# 应用规则
+apply_rules() {
+    echo "应用端口跳跃规则: \$START_PORT-\$END_PORT -> \$ACTUAL_PORT"
+    
+    # IPv4
+    iptables -t nat -A PREROUTING -i \$INTERFACE -p udp --dport \$START_PORT:\$END_PORT -j REDIRECT --to-ports \$ACTUAL_PORT
+    
+    # IPv6 (如果支持)
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -t nat -A PREROUTING -i \$INTERFACE -p udp --dport \$START_PORT:\$END_PORT -j REDIRECT --to-ports \$ACTUAL_PORT
+    fi
+    
+    echo "端口跳跃规则已应用"
+}
+
+# 检查规则状态
+check_rules() {
+    echo "当前 IPv4 NAT 规则:"
+    iptables -t nat -L PREROUTING -n --line-numbers | grep -E "(REDIRECT|$start_port|$end_port|$actual_port)" || echo "未找到相关规则"
+    
+    if command -v ip6tables >/dev/null 2>&1; then
+        echo ""
+        echo "当前 IPv6 NAT 规则:"
+        ip6tables -t nat -L PREROUTING -n --line-numbers | grep -E "(REDIRECT|$start_port|$end_port|$actual_port)" || echo "未找到相关规则"
+    fi
+}
+
+# 主要逻辑
+case "\$1" in
+    "start"|"apply")
+        cleanup_rules
+        apply_rules
+        ;;
+    "stop"|"cleanup")
+        cleanup_rules
+        echo "端口跳跃规则已清理"
+        ;;
+    "status"|"check")
+        check_rules
+        ;;
+    "restart")
+        cleanup_rules
+        apply_rules
+        ;;
+    *)
+        echo "用法: \$0 {start|stop|status|restart}"
+        exit 1
+        ;;
+esac
+EOF
+    
+    chmod +x "$IPTABLES_RULES_FILE"
+    
+    # 应用规则
+    print_info "应用 iptables 规则..."
+    "$IPTABLES_RULES_FILE" start
+    
+    if [[ $? -eq 0 ]]; then
+        print_success "端口跳跃规则应用成功"
+    else
+        print_error "端口跳跃规则应用失败"
+        return 1
+    fi
+    
+    # 保存 iptables 规则（持久化）
+    save_iptables_rules
+    
+    # 创建系统服务以在启动时应用规则
+    create_port_hopping_service
+    
+    # 保存配置信息
+    cat > "$HYSTERIA_DIR/port-hopping.conf" << EOF
+# Hysteria 2 端口跳跃配置
+ENABLED=true
+INTERFACE=$interface
+ACTUAL_PORT=$actual_port
+START_PORT=$start_port
+END_PORT=$end_port
+CREATED=$(date)
+EOF
+    
+    print_success "端口跳跃配置完成！"
+    echo -e "${CYAN}配置信息:${NC}"
+    echo "  跳跃端口范围: $start_port-$end_port"
+    echo "  实际监听端口: $actual_port"
+    echo "  网络接口: $interface"
+    echo ""
+    echo -e "${YELLOW}客户端配置提示:${NC}"
+    echo "  在客户端配置中使用端口范围: $start_port-$end_port"
+    echo "  例如: server: yourdomain.com:$start_port-$end_port"
+}
+
+# 禁用端口跳跃
+disable_port_hopping() {
+    print_info "禁用端口跳跃..."
+    
+    if [[ -f "$IPTABLES_RULES_FILE" ]]; then
+        "$IPTABLES_RULES_FILE" stop
+        print_success "端口跳跃规则已清理"
+    fi
+    
+    # 停用系统服务
+    systemctl stop hysteria2-port-hopping 2>/dev/null || true
+    systemctl disable hysteria2-port-hopping 2>/dev/null || true
+    
+    # 更新配置
+    if [[ -f "$HYSTERIA_DIR/port-hopping.conf" ]]; then
+        sed -i 's/ENABLED=true/ENABLED=false/' "$HYSTERIA_DIR/port-hopping.conf"
+    fi
+    
+    print_success "端口跳跃已禁用"
+}
+
+# 查看端口跳跃状态
+show_port_hopping_status() {
+    print_info "端口跳跃状态："
+    
+    if [[ -f "$HYSTERIA_DIR/port-hopping.conf" ]]; then
+        source "$HYSTERIA_DIR/port-hopping.conf"
+        
+        echo -e "${BLUE}配置信息:${NC}"
+        echo "  状态: ${ENABLED:-false}"
+        echo "  端口范围: ${START_PORT:-未配置}-${END_PORT:-未配置}"
+        echo "  实际端口: ${ACTUAL_PORT:-未配置}"
+        echo "  网络接口: ${INTERFACE:-未配置}"
+        echo "  创建时间: ${CREATED:-未知}"
+        echo ""
+    else
+        print_warning "未找到端口跳跃配置"
+    fi
+    
+    if [[ -f "$IPTABLES_RULES_FILE" ]]; then
+        echo -e "${BLUE}当前规则状态:${NC}"
+        "$IPTABLES_RULES_FILE" status
+    else
+        print_warning "端口跳跃规则脚本不存在"
+    fi
+}
+
+# 保存 iptables 规则
+save_iptables_rules() {
+    print_info "保存 iptables 规则..."
+    
+    if command -v iptables-save >/dev/null 2>&1; then
+        if command -v netfilter-persistent >/dev/null 2>&1; then
+            # Ubuntu/Debian 方式
+            iptables-save > /etc/iptables/rules.v4
+            if command -v ip6tables-save >/dev/null 2>&1; then
+                ip6tables-save > /etc/iptables/rules.v6
+            fi
+            print_success "规则已保存 (netfilter-persistent)"
+        elif command -v service >/dev/null 2>&1 && service iptables status >/dev/null 2>&1; then
+            # CentOS/RHEL 方式
+            service iptables save
+            print_success "规则已保存 (iptables service)"
+        else
+            print_warning "无法自动保存规则，重启后可能丢失"
+        fi
+    fi
+}
+
+# 创建端口跳跃服务
+create_port_hopping_service() {
+    print_info "创建端口跳跃系统服务..."
+    
+    cat > "/etc/systemd/system/hysteria2-port-hopping.service" << EOF
+[Unit]
+Description=Hysteria 2 Port Hopping Rules
+After=network.target
+Before=hysteria2.service
+
+[Service]
+Type=oneshot
+ExecStart=$IPTABLES_RULES_FILE start
+ExecStop=$IPTABLES_RULES_FILE stop
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    
+    systemctl daemon-reload
+    systemctl enable hysteria2-port-hopping
+    
+    print_success "端口跳跃服务创建完成"
 }
 
 # 生成配置
@@ -463,8 +746,9 @@ create_service() {
     cat > "$SERVICE_FILE" << EOF
 [Unit]
 Description=Hysteria 2 Server
-After=network.target nss-lookup.target
+After=network.target nss-lookup.target hysteria2-port-hopping.service
 Wants=network.target
+Requires=hysteria2-port-hopping.service
 
 [Service]
 Type=simple
@@ -493,6 +777,12 @@ start_service() {
     else
         print_error "配置验证失败"
         return 1
+    fi
+    
+    # 启动端口跳跃服务（如果存在）
+    if systemctl list-unit-files | grep -q hysteria2-port-hopping; then
+        systemctl restart hysteria2-port-hopping
+        print_info "端口跳跃服务已重启"
     fi
     
     # 启动服务
@@ -538,9 +828,19 @@ generate_client_config() {
     local password="${PASSWORD:-$(grep 'password:' "$CONFIG_FILE" | sed 's/.*password: *"//' | sed 's/".*//')}"
     local port="${PORT:-$(grep 'listen:' "$CONFIG_FILE" | awk -F: '{print $NF}' | tr -d ' ')}"
     
+    # 检查是否配置了端口跳跃
+    local server_address="$domain:$port"
+    if [[ -f "$HYSTERIA_DIR/port-hopping.conf" ]]; then
+        source "$HYSTERIA_DIR/port-hopping.conf"
+        if [[ "$ENABLED" == "true" ]]; then
+            server_address="$domain:$START_PORT-$END_PORT"
+            print_info "检测到端口跳跃配置，使用端口范围: $START_PORT-$END_PORT"
+        fi
+    fi
+    
     # 生成配置
     cat > "/root/hysteria2-client.yaml" << EOF
-server: $domain:$port
+server: $server_address
 auth: "$password"
 
 tls:
@@ -571,10 +871,19 @@ EOF
     echo -e "${CYAN}╔═══════════════════════════════════╗${NC}"
     echo -e "${CYAN}║         客户端连接信息            ║${NC}"
     echo -e "${CYAN}╠═══════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC} ${GREEN}服务器:${NC} $domain:$port"
+    echo -e "${CYAN}║${NC} ${GREEN}服务器:${NC} $server_address"
     echo -e "${CYAN}║${NC} ${GREEN}密码:${NC} $password"
     echo -e "${CYAN}║${NC} ${GREEN}SOCKS5:${NC} 127.0.0.1:1080"
     echo -e "${CYAN}║${NC} ${GREEN}HTTP:${NC} 127.0.0.1:8080"
+    
+    # 显示端口跳跃信息
+    if [[ -f "$HYSTERIA_DIR/port-hopping.conf" ]]; then
+        source "$HYSTERIA_DIR/port-hopping.conf"
+        if [[ "$ENABLED" == "true" ]]; then
+            echo -e "${CYAN}║${NC} ${YELLOW}端口跳跃:${NC} $START_PORT-$END_PORT -> $ACTUAL_PORT"
+        fi
+    fi
+    
     echo -e "${CYAN}╚═══════════════════════════════════╝${NC}"
     echo ""
 }
@@ -611,6 +920,10 @@ show_status() {
     else
         print_warning "配置文件不存在"
     fi
+    
+    echo ""
+    echo -e "${BLUE}🚀 端口跳跃状态:${NC}"
+    show_port_hopping_status
     
     echo ""
     echo -e "${BLUE}🔐 证书状态:${NC}"
@@ -665,7 +978,17 @@ full_install() {
     generate_config || return 1
     create_service || return 1
     start_service || return 1
-    generate_client_config
+    
+    # 询问是否配置端口跳跃
+    echo ""
+    read -p "是否配置端口跳跃功能？(y/n): " enable_hopping
+    if [[ "$enable_hopping" =~ ^[Yy]$ ]]; then
+        configure_port_hopping
+        # 重新生成客户端配置以包含端口跳跃信息
+        generate_client_config
+    else
+        generate_client_config
+    fi
     
     print_success "🎉 安装完成！"
     show_status
@@ -675,9 +998,10 @@ full_install() {
 show_menu() {
     while true; do
         clear
-        echo -e "${CYAN}╔════════════════════════════════╗${NC}"
-        echo -e "${CYAN}║      Hysteria 2 管理工具       ║${NC}"
-        echo -e "${CYAN}╚════════════════════════════════╝${NC}"
+        echo -e "${CYAN}╔══════════════════════════════════════╗${NC}"
+        echo -e "${CYAN}║        Hysteria 2 管理工具           ║${NC}"
+        echo -e "${CYAN}║      (支持端口跳跃功能)              ║${NC}"
+        echo -e "${CYAN}╚══════════════════════════════════════╝${NC}"
         echo ""
         echo "1) 🚀 完整安装"
         echo "2) 📦 仅安装程序"
@@ -687,11 +1011,12 @@ show_menu() {
         echo "6) ▶️  启动服务"
         echo "7) 📊 查看状态"
         echo "8) 📝 客户端配置"
-        echo "9) 🗑️  卸载"
+        echo "9) 🚀 端口跳跃配置"
+        echo "10) 🗑️ 卸载"
         echo "0) 🚪 退出"
         echo ""
         
-        read -p "请选择 [0-9]: " choice
+        read -p "请选择 [0-10]: " choice
         echo ""
         
         case $choice in
@@ -703,12 +1028,26 @@ show_menu() {
             6) systemctl restart hysteria2; show_status ;;
             7) show_status ;;
             8) generate_client_config ;;
-            9)
+            9) setup_port_hopping ;;
+            10)
                 read -p "确认卸载？(y/n): " confirm
                 if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                    # 清理端口跳跃规则
+                    if [[ -f "$IPTABLES_RULES_FILE" ]]; then
+                        "$IPTABLES_RULES_FILE" stop
+                    fi
+                    
+                    # 停止并删除服务
                     systemctl stop hysteria2 2>/dev/null || true
                     systemctl disable hysteria2 2>/dev/null || true
+                    systemctl stop hysteria2-port-hopping 2>/dev/null || true
+                    systemctl disable hysteria2-port-hopping 2>/dev/null || true
+                    
+                    # 删除文件
                     rm -f "$SERVICE_FILE" "$HYSTERIA_BINARY"
+                    rm -f "/etc/systemd/system/hysteria2-port-hopping.service"
+                    rm -rf "$HYSTERIA_DIR"
+                    
                     systemctl daemon-reload
                     print_success "卸载完成"
                 fi
@@ -728,6 +1067,7 @@ main() {
         "status"|"s") show_status ;;
         "cert"|"c") install_acme_clean && request_certificate ;;
         "fix") fix_certificate_format ;;
+        "hopping"|"h") setup_port_hopping ;;
         *) show_menu ;;
     esac
 }

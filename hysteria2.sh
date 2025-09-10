@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Hysteria 2 完整安装脚本 - 修复安装问题和添加端口跳跃功能
+# Hysteria 2 完整安装脚本 - 修复服务依赖问题
 # 改进下载逻辑、服务端bandwidth配置和添加重启选项
 
 # 颜色定义
@@ -824,16 +824,23 @@ validate_config() {
     return 0
 }
 
-# 创建系统服务
+# 🔧 修复：创建灵活的系统服务（不强制依赖端口跳跃服务）
 create_service() {
     print_step "创建系统服务..."
     
-    cat > "$SERVICE_FILE" << EOF
+    # 检查是否存在端口跳跃服务
+    local has_port_hopping=false
+    if systemctl list-unit-files | grep -q "hysteria2-port-hopping.service"; then
+        has_port_hopping=true
+    fi
+    
+    # 根据是否有端口跳跃服务创建不同的依赖
+    if [[ "$has_port_hopping" = true ]]; then
+        cat > "$SERVICE_FILE" << EOF
 [Unit]
 Description=Hysteria 2 Server
 After=network.target nss-lookup.target hysteria2-port-hopping.service
-Wants=network.target
-Requires=hysteria2-port-hopping.service
+Wants=network.target hysteria2-port-hopping.service
 
 [Service]
 Type=simple
@@ -846,13 +853,32 @@ LimitNOFILE=infinity
 [Install]
 WantedBy=multi-user.target
 EOF
+    else
+        cat > "$SERVICE_FILE" << EOF
+[Unit]
+Description=Hysteria 2 Server
+After=network.target nss-lookup.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=$HYSTERIA_BINARY server -c $CONFIG_FILE
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=infinity
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    fi
     
     systemctl daemon-reload
     systemctl enable hysteria2
     print_success "服务创建完成"
 }
 
-# 启动服务
+# 🔧 修复：启动服务（不强制要求端口跳跃服务）
 start_service() {
     print_step "启动服务..."
     
@@ -870,10 +896,17 @@ start_service() {
         return 1
     fi
     
-    # 启动端口跳跃服务（如果存在）
-    if systemctl list-unit-files | grep -q hysteria2-port-hopping; then
-        systemctl restart hysteria2-port-hopping
-        print_info "端口跳跃服务已重启"
+    # 尝试启动端口跳跃服务（如果存在且未启动）
+    if systemctl list-unit-files | grep -q "hysteria2-port-hopping.service"; then
+        print_info "检测到端口跳跃服务，尝试启动..."
+        if systemctl restart hysteria2-port-hopping 2>/dev/null; then
+            print_success "端口跳跃服务启动成功"
+        else
+            print_warning "端口跳跃服务启动失败，继续启动主服务"
+        fi
+        sleep 2
+    else
+        print_info "未检测到端口跳跃服务配置"
     fi
     
     # 启动服务
@@ -885,20 +918,20 @@ start_service() {
     
     # 检查服务状态
     if systemctl is-active --quiet hysteria2; then
-        print_success "服务启动成功"
+        print_success "✅ 服务启动成功"
         
         # 检查端口监听
         local port="${PORT:-$(grep 'listen:' "$CONFIG_FILE" | awk -F: '{print $NF}' | tr -d ' ')}"
         if lsof -i:$port >/dev/null 2>&1; then
-            print_success "端口 $port 监听正常"
+            print_success "✅ 端口 $port 监听正常"
         else
-            print_warning "端口 $port 监听检查失败"
+            print_warning "⚠️  端口 $port 监听检查失败"
             print_info "可能需要检查防火墙设置"
         fi
         
         return 0
     else
-        print_error "服务启动失败"
+        print_error "❌ 服务启动失败"
         print_info "查看错误日志:"
         journalctl -u hysteria2 --no-pager -n 20
         return 1
@@ -931,7 +964,11 @@ restart_service() {
     # 重启端口跳跃服务（如果存在）
     if systemctl list-unit-files | grep -q hysteria2-port-hopping; then
         print_info "重启端口跳跃服务..."
-        systemctl restart hysteria2-port-hopping
+        if systemctl restart hysteria2-port-hopping 2>/dev/null; then
+            print_success "端口跳跃服务重启成功"
+        else
+            print_warning "端口跳跃服务重启失败，继续重启主服务"
+        fi
         sleep 2
     fi
     
@@ -958,7 +995,7 @@ restart_service() {
         # 显示运行状态
         echo ""
         echo -e "${GREEN}服务状态:${NC}"
-        systemctl status hysteria2 --no-pager -l
+        systemctl status hysteria2 --no-pager -l | head -20
         
         return 0
     else
@@ -1164,6 +1201,8 @@ full_install() {
     read -p "是否配置端口跳跃功能？(y/n): " enable_hopping
     if [[ "$enable_hopping" =~ ^[Yy]$ ]]; then
         configure_port_hopping
+        # 重新创建服务文件以包含端口跳跃依赖
+        create_service
         # 重新生成客户端配置以包含端口跳跃信息
         generate_client_config
     else

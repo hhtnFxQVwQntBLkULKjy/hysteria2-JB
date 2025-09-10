@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Hysteria 2 完整安装脚本 - 添加端口跳跃功能
-# 改进私钥验证和证书处理，新增端口跳跃配置
+# Hysteria 2 完整安装脚本 - 修复安装问题和添加端口跳跃功能
+# 改进下载逻辑、服务端bandwidth配置和添加重启选项
 
 # 颜色定义
 RED='\033[0;31m'
@@ -40,10 +40,13 @@ check_system() {
     ARCH=$(uname -m)
     case $ARCH in
         x86_64) ARCH="amd64" ;;
-        aarch64) ARCH="arm64" ;;
+        aarch64|arm64) ARCH="arm64" ;;
         armv7l) ARCH="arm" ;;
+        armv8*) ARCH="arm64" ;;
         *) print_error "不支持的架构: $ARCH"; exit 1 ;;
     esac
+    
+    print_info "系统架构: $ARCH"
     
     # 安装依赖
     print_info "安装必要工具..."
@@ -53,35 +56,99 @@ check_system() {
     elif command -v yum &> /dev/null; then
         yum update -y -q
         yum install -y curl wget tar socat openssl crontabs net-tools bind-utils lsof iptables-services
+    elif command -v dnf &> /dev/null; then
+        dnf update -y -q
+        dnf install -y curl wget tar socat openssl cronie net-tools bind-utils lsof iptables-services
     fi
     
     print_success "系统检查完成 ($ARCH)"
 }
 
-# 安装 Hysteria 2
+# 改进的安装 Hysteria 2 函数
 install_hysteria2() {
     print_step "安装 Hysteria 2..."
     
-    LATEST_VERSION=$(curl -s https://api.github.com/repos/apernet/hysteria/releases/latest | grep '"tag_name"' | cut -d'"' -f4)
-    LATEST_VERSION=${LATEST_VERSION:-"v2.6.0"}
+    # 先清理可能存在的旧文件
+    rm -f "$HYSTERIA_BINARY" 2>/dev/null || true
     
+    # 获取最新版本
+    print_info "获取最新版本信息..."
+    LATEST_VERSION=""
+    
+    # 尝试多种方式获取版本
+    for i in {1..3}; do
+        LATEST_VERSION=$(curl -s --connect-timeout 10 --max-time 30 \
+            "https://api.github.com/repos/apernet/hysteria/releases/latest" | \
+            grep '"tag_name"' | cut -d'"' -f4 2>/dev/null)
+        
+        if [[ -n "$LATEST_VERSION" ]]; then
+            break
+        fi
+        
+        print_warning "第 $i 次获取版本失败，重试中..."
+        sleep 2
+    done
+    
+    # 如果仍然失败，使用备用版本
+    if [[ -z "$LATEST_VERSION" ]]; then
+        LATEST_VERSION="v2.6.0"
+        print_warning "无法获取最新版本，使用默认版本: $LATEST_VERSION"
+    else
+        print_info "最新版本: $LATEST_VERSION"
+    fi
+    
+    # 构造下载链接
     DOWNLOAD_URL="https://github.com/apernet/hysteria/releases/download/$LATEST_VERSION/hysteria-linux-$ARCH"
     
-    print_info "下载版本: $LATEST_VERSION"
-    if curl -L -o "$HYSTERIA_BINARY" "$DOWNLOAD_URL" --connect-timeout 30; then
-        chmod +x "$HYSTERIA_BINARY"
-        print_success "Hysteria 2 安装完成"
-        
-        # 验证安装
-        if "$HYSTERIA_BINARY" version >/dev/null 2>&1; then
-            print_success "程序验证通过"
-            return 0
-        else
-            print_error "程序验证失败"
-            return 1
+    print_info "下载地址: $DOWNLOAD_URL"
+    
+    # 尝试下载
+    print_info "正在下载 Hysteria 2..."
+    local download_success=false
+    
+    # 尝试多次下载
+    for i in {1..3}; do
+        if curl -L --progress-bar \
+            --connect-timeout 30 \
+            --max-time 300 \
+            --retry 3 \
+            --retry-delay 2 \
+            -o "$HYSTERIA_BINARY" \
+            "$DOWNLOAD_URL"; then
+            download_success=true
+            break
         fi
+        
+        print_warning "第 $i 次下载失败，重试中..."
+        rm -f "$HYSTERIA_BINARY" 2>/dev/null || true
+        sleep 3
+    done
+    
+    if [[ "$download_success" = false ]]; then
+        print_error "下载失败，请检查网络连接"
+        return 1
+    fi
+    
+    # 检查文件是否成功下载
+    if [[ ! -f "$HYSTERIA_BINARY" ]] || [[ ! -s "$HYSTERIA_BINARY" ]]; then
+        print_error "下载的文件无效"
+        rm -f "$HYSTERIA_BINARY" 2>/dev/null || true
+        return 1
+    fi
+    
+    # 设置执行权限
+    chmod +x "$HYSTERIA_BINARY"
+    
+    # 验证二进制文件
+    print_info "验证程序..."
+    if "$HYSTERIA_BINARY" version >/dev/null 2>&1; then
+        local version_info=$("$HYSTERIA_BINARY" version 2>/dev/null | head -1)
+        print_success "Hysteria 2 安装成功"
+        print_info "版本信息: $version_info"
+        return 0
     else
-        print_error "下载失败"
+        print_error "程序验证失败"
+        rm -f "$HYSTERIA_BINARY" 2>/dev/null || true
         return 1
     fi
 }
@@ -548,14 +615,15 @@ save_iptables_rules() {
     if command -v iptables-save >/dev/null 2>&1; then
         if command -v netfilter-persistent >/dev/null 2>&1; then
             # Ubuntu/Debian 方式
-            iptables-save > /etc/iptables/rules.v4
+            mkdir -p /etc/iptables
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
             if command -v ip6tables-save >/dev/null 2>&1; then
-                ip6tables-save > /etc/iptables/rules.v6
+                ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
             fi
             print_success "规则已保存 (netfilter-persistent)"
         elif command -v service >/dev/null 2>&1 && service iptables status >/dev/null 2>&1; then
             # CentOS/RHEL 方式
-            service iptables save
+            service iptables save 2>/dev/null || true
             print_success "规则已保存 (iptables service)"
         else
             print_warning "无法自动保存规则，重启后可能丢失"
@@ -589,7 +657,7 @@ EOF
     print_success "端口跳跃服务创建完成"
 }
 
-# 生成配置
+# 生成配置（修改：在服务端添加 bandwidth 配置）
 generate_config() {
     print_step "生成配置文件..."
     
@@ -618,12 +686,24 @@ generate_config() {
     read -p "伪装网站 (默认 https://www.bing.com): " masquerade
     masquerade=${masquerade:-https://www.bing.com}
     
+    # 🆕 询问带宽设置（可选）
+    local bandwidth_up="1 gbps"
+    local bandwidth_down="1 gbps"
+    
+    echo ""
+    echo -e "${YELLOW}带宽设置 (服务端限制):${NC}"
+    read -p "上行带宽 (默认 1 gbps): " input_up
+    read -p "下行带宽 (默认 1 gbps): " input_down
+    
+    [[ -n "$input_up" ]] && bandwidth_up="$input_up"
+    [[ -n "$input_down" ]] && bandwidth_down="$input_down"
+    
     # 保存到全局变量
     PORT="$port"
     PASSWORD="$password"
     export PORT PASSWORD
     
-    # 创建配置
+    # 创建配置（添加 bandwidth 配置）
     mkdir -p "$HYSTERIA_DIR"
     cat > "$CONFIG_FILE" << EOF
 listen: :$PORT
@@ -642,6 +722,10 @@ masquerade:
     url: $masquerade
     rewriteHost: true
 
+bandwidth:
+  up: $bandwidth_up
+  down: $bandwidth_down
+
 quic:
   initStreamReceiveWindow: 8388608
   maxStreamReceiveWindow: 8388608
@@ -658,10 +742,11 @@ EOF
     
     print_success "配置文件生成完成"
     
-    echo -e "${CYAN}配置信息:${NC}"
+    echo -e "${CYAN}服务端配置信息:${NC}"
     echo "域名: ${DOMAIN:-未设置}"
     echo "端口: $PORT"
     echo "密码: $PASSWORD"
+    echo "服务端带宽限制: 上行 $bandwidth_up / 下行 $bandwidth_down"
     echo "伪装: $masquerade"
 }
 
@@ -771,6 +856,12 @@ EOF
 start_service() {
     print_step "启动服务..."
     
+    # 检查 Hysteria 2 二进制文件
+    if [[ ! -f "$HYSTERIA_BINARY" ]]; then
+        print_error "Hysteria 2 程序不存在，请先安装"
+        return 1
+    fi
+    
     # 使用改进的验证方法
     if validate_config; then
         print_success "配置验证通过"
@@ -814,7 +905,71 @@ start_service() {
     fi
 }
 
-# 生成客户端配置
+# 🆕 重启服务函数
+restart_service() {
+    print_step "重启 Hysteria 2 服务..."
+    
+    # 检查 Hysteria 2 二进制文件
+    if [[ ! -f "$HYSTERIA_BINARY" ]]; then
+        print_error "Hysteria 2 程序不存在，请先安装"
+        return 1
+    fi
+    
+    # 检查配置文件
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        print_error "配置文件不存在，请先生成配置"
+        return 1
+    fi
+    
+    # 验证配置
+    print_info "验证配置..."
+    if ! validate_config; then
+        print_error "配置验证失败，取消重启"
+        return 1
+    fi
+    
+    # 重启端口跳跃服务（如果存在）
+    if systemctl list-unit-files | grep -q hysteria2-port-hopping; then
+        print_info "重启端口跳跃服务..."
+        systemctl restart hysteria2-port-hopping
+        sleep 2
+    fi
+    
+    # 重启主服务
+    print_info "重启主服务..."
+    systemctl restart hysteria2
+    
+    # 等待服务启动
+    print_info "等待服务启动..."
+    sleep 5
+    
+    # 检查服务状态
+    if systemctl is-active --quiet hysteria2; then
+        print_success "✅ 服务重启成功"
+        
+        # 检查端口监听
+        local port=$(grep "listen:" "$CONFIG_FILE" | awk -F: '{print $NF}' | tr -d ' ')
+        if lsof -i:$port >/dev/null 2>&1; then
+            print_success "✅ 端口 $port 监听正常"
+        else
+            print_warning "⚠️  端口 $port 监听检查失败"
+        fi
+        
+        # 显示运行状态
+        echo ""
+        echo -e "${GREEN}服务状态:${NC}"
+        systemctl status hysteria2 --no-pager -l
+        
+        return 0
+    else
+        print_error "❌ 服务重启失败"
+        print_info "错误日志:"
+        journalctl -u hysteria2 --no-pager -n 10
+        return 1
+    fi
+}
+
+# 生成客户端配置（修改 bandwidth 为 1 gbps）
 generate_client_config() {
     print_step "生成客户端配置..."
     
@@ -838,7 +993,7 @@ generate_client_config() {
         fi
     fi
     
-    # 生成配置
+    # 生成配置（修改 bandwidth 为 1 gbps）
     cat > "/root/hysteria2-client.yaml" << EOF
 server: $server_address
 auth: "$password"
@@ -855,8 +1010,8 @@ quic:
   maxIdleTimeout: 30s
 
 bandwidth:
-  up: 50 mbps
-  down: 200 mbps
+  up: 1 gbps
+  down: 1 gbps
 
 socks5:
   listen: 127.0.0.1:1080
@@ -873,6 +1028,7 @@ EOF
     echo -e "${CYAN}╠═══════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC} ${GREEN}服务器:${NC} $server_address"
     echo -e "${CYAN}║${NC} ${GREEN}密码:${NC} $password"
+    echo -e "${CYAN}║${NC} ${GREEN}带宽:${NC} 上行 1 Gbps / 下行 1 Gbps"
     echo -e "${CYAN}║${NC} ${GREEN}SOCKS5:${NC} 127.0.0.1:1080"
     echo -e "${CYAN}║${NC} ${GREEN}HTTP:${NC} 127.0.0.1:8080"
     
@@ -955,6 +1111,30 @@ show_status() {
     else
         print_error "❌ 证书文件不存在"
     fi
+    
+    echo ""
+    echo -e "${BLUE}📦 程序信息:${NC}"
+    if [[ -f "$HYSTERIA_BINARY" ]]; then
+        print_success "✅ 程序文件存在"
+        if "$HYSTERIA_BINARY" version >/dev/null 2>&1; then
+            local version_info=$("$HYSTERIA_BINARY" version 2>/dev/null | head -1)
+            echo "   版本: $version_info"
+        fi
+    else
+        print_error "❌ 程序文件不存在"
+    fi
+    
+    echo ""
+    echo -e "${BLUE}⚙️ 服务端配置信息:${NC}"
+    if [[ -f "$CONFIG_FILE" ]]; then
+        local server_bandwidth_up=$(grep -A1 "bandwidth:" "$CONFIG_FILE" | grep "up:" | awk '{print $2}')
+        local server_bandwidth_down=$(grep -A2 "bandwidth:" "$CONFIG_FILE" | grep "down:" | awk '{print $2}')
+        if [[ -n "$server_bandwidth_up" && -n "$server_bandwidth_down" ]]; then
+            echo "   服务端带宽限制: 上行 $server_bandwidth_up / 下行 $server_bandwidth_down"
+        else
+            print_warning "   未配置服务端带宽限制"
+        fi
+    fi
 }
 
 # 完整安装
@@ -1009,14 +1189,15 @@ show_menu() {
         echo "4) ⚙️  生成配置"
         echo "5) 🔧 修复证书格式"
         echo "6) ▶️  启动服务"
-        echo "7) 📊 查看状态"
-        echo "8) 📝 客户端配置"
-        echo "9) 🚀 端口跳跃配置"
-        echo "10) 🗑️ 卸载"
+        echo "7) 🔄 重启服务"
+        echo "8) 📊 查看状态"
+        echo "9) 📝 客户端配置"
+        echo "10) 🚀 端口跳跃配置"
+        echo "11) 🗑️ 卸载"
         echo "0) 🚪 退出"
         echo ""
         
-        read -p "请选择 [0-10]: " choice
+        read -p "请选择 [0-11]: " choice
         echo ""
         
         case $choice in
@@ -1025,11 +1206,12 @@ show_menu() {
             3) install_acme_clean && request_certificate ;;
             4) generate_config ;;
             5) fix_certificate_format ;;
-            6) systemctl restart hysteria2; show_status ;;
-            7) show_status ;;
-            8) generate_client_config ;;
-            9) setup_port_hopping ;;
-            10)
+            6) start_service ;;
+            7) restart_service ;;
+            8) show_status ;;
+            9) generate_client_config ;;
+            10) setup_port_hopping ;;
+            11)
                 read -p "确认卸载？(y/n): " confirm
                 if [[ "$confirm" =~ ^[Yy]$ ]]; then
                     # 清理端口跳跃规则
@@ -1068,6 +1250,7 @@ main() {
         "cert"|"c") install_acme_clean && request_certificate ;;
         "fix") fix_certificate_format ;;
         "hopping"|"h") setup_port_hopping ;;
+        "restart"|"r") restart_service ;;
         *) show_menu ;;
     esac
 }

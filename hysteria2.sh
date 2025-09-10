@@ -108,23 +108,74 @@ install_hysteria2() {
     fi
 }
 
+# 获取用户邮箱
+get_user_email() {
+    local email=""
+    
+    # 尝试从现有配置读取
+    if [[ -f ~/.acme.sh/account.conf ]]; then
+        email=$(grep "ACCOUNT_EMAIL" ~/.acme.sh/account.conf | cut -d'"' -f2 2>/dev/null)
+    fi
+    
+    # 如果没有找到或者是默认邮箱，要求用户输入
+    if [[ -z "$email" || "$email" == "admin@example.com" ]]; then
+        while true; do
+            read -p "请输入您的邮箱地址（用于 Let's Encrypt 注册）: " email
+            
+            # 验证邮箱格式
+            if [[ "$email" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+                # 检查是否是禁止的域名
+                if [[ "$email" =~ @example\.(com|org|net)$ ]]; then
+                    print_error "不能使用 example.com 等示例域名邮箱"
+                    continue
+                fi
+                break
+            else
+                print_error "邮箱格式不正确，请重新输入"
+            fi
+        done
+    fi
+    
+    echo "$email"
+}
+
 # 安装和配置 acme.sh
 install_acme() {
     print_step "安装和配置 acme.sh..."
     
-    if [[ ! -f ~/.acme.sh/acme.sh ]]; then
+    # 获取用户邮箱
+    USER_EMAIL=$(get_user_email)
+    print_info "使用邮箱: $USER_EMAIL"
+    
+    # 检查是否已安装
+    if [[ -f ~/.acme.sh/acme.sh ]]; then
+        print_info "acme.sh 已安装，检查配置..."
+        
+        # 检查邮箱配置
+        if grep -q "admin@example.com" ~/.acme.sh/account.conf 2>/dev/null; then
+            print_warning "发现默认邮箱配置，需要重新配置..."
+            
+            # 删除旧的账户配置
+            rm -rf ~/.acme.sh/ca/
+            rm -f ~/.acme.sh/account.conf
+            
+            # 重新安装
+            curl https://get.acme.sh | sh -s email="$USER_EMAIL"
+        else
+            print_info "acme.sh 配置正常"
+        fi
+    else
         print_info "安装 acme.sh..."
-        curl https://get.acme.sh | sh -s email=admin@example.com
+        curl https://get.acme.sh | sh -s email="$USER_EMAIL"
         
         # 添加到 PATH
         if ! grep -q ".acme.sh" ~/.bashrc; then
             echo 'export PATH="$HOME/.acme.sh:$PATH"' >> ~/.bashrc
         fi
-        
-        source ~/.acme.sh/acme.sh.env
-    else
-        print_info "acme.sh 已安装"
     fi
+    
+    # 确保环境变量加载
+    source ~/.acme.sh/acme.sh.env 2>/dev/null || true
     
     # 设置默认 CA 为 Let's Encrypt
     print_info "设置默认 CA 为 Let's Encrypt..."
@@ -132,6 +183,13 @@ install_acme() {
     
     # 确保配置文件中设置正确
     if [[ -f ~/.acme.sh/account.conf ]]; then
+        # 更新邮箱设置
+        if ! grep -q "ACCOUNT_EMAIL.*$USER_EMAIL" ~/.acme.sh/account.conf; then
+            sed -i "/ACCOUNT_EMAIL=/d" ~/.acme.sh/account.conf
+            echo "ACCOUNT_EMAIL=\"$USER_EMAIL\"" >> ~/.acme.sh/account.conf
+        fi
+        
+        # 确保 CA 设置
         if ! grep -q "DEFAULT_CA.*letsencrypt" ~/.acme.sh/account.conf; then
             sed -i 's/DEFAULT_CA=.*/DEFAULT_CA="https:\/\/acme-v02.api.letsencrypt.org\/directory"/' ~/.acme.sh/account.conf
             if ! grep -q "DEFAULT_CA" ~/.acme.sh/account.conf; then
@@ -168,35 +226,112 @@ request_certificate() {
     systemctl stop apache2 2>/dev/null || true
     
     # 检查端口占用
+    print_info "检查端口占用..."
     if netstat -tuln | grep -q ":80 "; then
         print_warning "端口 80 被占用，尝试释放..."
-        pkill -f ":80" 2>/dev/null || true
-        sleep 2
+        
+        # 查找占用进程
+        PIDS=$(lsof -ti:80 2>/dev/null || netstat -tlnp | grep ":80 " | awk '{print $7}' | cut -d'/' -f1)
+        if [[ -n "$PIDS" ]]; then
+            echo "占用端口 80 的进程: $PIDS"
+            for pid in $PIDS; do
+                if [[ "$pid" =~ ^[0-9]+$ ]]; then
+                    kill -9 "$pid" 2>/dev/null || true
+                fi
+            done
+            sleep 2
+        fi
     fi
     
-    # 申请证书
+    # 最终检查
+    if netstat -tuln | grep -q ":80 "; then
+        print_error "端口 80 仍被占用，请手动释放后重试"
+        netstat -tlnp | grep ":80"
+        return 1
+    fi
+    
+    # 确保 acme.sh 环境
+    source ~/.acme.sh/acme.sh.env 2>/dev/null || true
+    
+    # 申请证书（添加详细日志）
     print_info "使用 Let's Encrypt 申请证书..."
     if ~/.acme.sh/acme.sh --issue \
         -d "$DOMAIN" \
         --standalone \
         --server letsencrypt \
-        --keylength 2048; then
+        --keylength 2048 \
+        --debug 2; then
         
         print_success "证书申请成功"
         
         # 安装证书
+        print_info "安装证书..."
         ~/.acme.sh/acme.sh --installcert -d "$DOMAIN" \
             --key-file "$CERT_DIR/server.key" \
             --fullchain-file "$CERT_DIR/server.crt" \
             --reloadcmd "systemctl restart hysteria2" \
             --server letsencrypt
             
+        # 设置文件权限
+        chmod 600 "$CERT_DIR/server.key"
+        chmod 644 "$CERT_DIR/server.crt"
+        
         print_success "证书安装完成"
         return 0
     else
         print_error "证书申请失败"
+        print_info "查看详细日志..."
+        tail -20 ~/.acme.sh/acme.sh.log
         return 1
     fi
+}
+
+# 修复证书申请问题
+fix_certificate_issues() {
+    print_step "修复证书申请问题..."
+    
+    print_info "1. 清理旧的账户配置..."
+    if [[ -f ~/.acme.sh/account.conf ]]; then
+        # 检查是否有问题的邮箱
+        if grep -q "admin@example.com" ~/.acme.sh/account.conf; then
+            print_warning "发现问题邮箱配置，清理中..."
+            rm -rf ~/.acme.sh/ca/ 2>/dev/null || true
+            
+            # 备份其他配置
+            if [[ -f ~/.acme.sh/account.conf ]]; then
+                grep -v "ACCOUNT_EMAIL\|DEFAULT_CA" ~/.acme.sh/account.conf > /tmp/acme_backup.conf 2>/dev/null || true
+            fi
+            
+            # 重新配置邮箱
+            USER_EMAIL=$(get_user_email)
+            
+            # 恢复配置
+            echo "ACCOUNT_EMAIL=\"$USER_EMAIL\"" > ~/.acme.sh/account.conf
+            echo 'DEFAULT_CA="https://acme-v02.api.letsencrypt.org/directory"' >> ~/.acme.sh/account.conf
+            
+            if [[ -f /tmp/acme_backup.conf ]]; then
+                cat /tmp/acme_backup.conf >> ~/.acme.sh/account.conf
+                rm -f /tmp/acme_backup.conf
+            fi
+            
+            print_success "邮箱配置已更新"
+        fi
+    fi
+    
+    print_info "2. 设置正确的 CA..."
+    ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+    
+    print_info "3. 清理可能的端口占用..."
+    # 停止所有可能的服务
+    for service in nginx apache2 httpd lighttpd caddy; do
+        systemctl stop "$service" 2>/dev/null || true
+    done
+    
+    # 强制清理端口
+    pkill -f ":80" 2>/dev/null || true
+    sleep 2
+    
+    print_success "修复完成，请重新申请证书"
 }
 
 # 生成配置文件
@@ -264,7 +399,7 @@ EOF
     echo "监听端口: $PORT"
     echo "密码: $PASSWORD"
     echo "伪装网站: $MASQUERADE"
-    echo "域名: $DOMAIN"
+    echo "域名: ${DOMAIN:-未设置}"
 }
 
 # 创建系统服务
@@ -333,7 +468,7 @@ generate_client_config() {
     print_step "生成客户端配置..."
     
     if [[ -z "$DOMAIN" ]]; then
-        DOMAIN=$(openssl x509 -in "$CERT_DIR/server.crt" -noout -subject | grep -o 'CN=[^,]*' | cut -d'=' -f2 2>/dev/null || echo "your-domain.com")
+        DOMAIN=$(openssl x509 -in "$CERT_DIR/server.crt" -noout -subject 2>/dev/null | grep -o 'CN=[^,]*' | cut -d'=' -f2 || echo "your-domain.com")
     fi
     
     if [[ -z "$PASSWORD" ]]; then
@@ -409,17 +544,8 @@ fix_letsencrypt() {
         NEED_REISSUE=true
     fi
     
-    # 设置默认 CA 为 Let's Encrypt
-    print_info "设置默认 CA 为 Let's Encrypt..."
-    ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
-    
-    # 修复配置文件
-    if [[ -f ~/.acme.sh/account.conf ]]; then
-        sed -i 's/DEFAULT_CA=.*/DEFAULT_CA="https:\/\/acme-v02.api.letsencrypt.org\/directory"/' ~/.acme.sh/account.conf
-        if ! grep -q "DEFAULT_CA" ~/.acme.sh/account.conf; then
-            echo 'DEFAULT_CA="https://acme-v02.api.letsencrypt.org/directory"' >> ~/.acme.sh/account.conf
-        fi
-    fi
+    # 修复 acme.sh 配置
+    fix_certificate_issues
     
     if [[ "$NEED_REISSUE" == "true" ]]; then
         echo ""
@@ -475,6 +601,10 @@ reissue_certificate() {
     systemctl stop nginx 2>/dev/null || true
     systemctl stop apache2 2>/dev/null || true
     
+    # 清理端口
+    pkill -f ":80" 2>/dev/null || true
+    sleep 2
+    
     # 删除旧证书记录
     ~/.acme.sh/acme.sh --remove -d "$DOMAIN" 2>/dev/null || true
     
@@ -493,6 +623,10 @@ reissue_certificate() {
             --reloadcmd "systemctl restart hysteria2" \
             --server letsencrypt
             
+        # 设置权限
+        chmod 600 "$CERT_DIR/server.key"
+        chmod 644 "$CERT_DIR/server.crt"
+            
         print_success "Let's Encrypt 证书申请成功"
         
         # 重启服务
@@ -500,7 +634,8 @@ reissue_certificate() {
         
         return 0
     else
-        print_error "证书申请失败"
+        print_error "证书申请失败，查看详细日志："
+        tail -20 ~/.acme.sh/acme.sh.log
         return 1
     fi
 }
@@ -539,6 +674,11 @@ show_certificate_info() {
     
     echo -e "\n${BLUE}acme.sh 证书列表:${NC}"
     ~/.acme.sh/acme.sh --list 2>/dev/null || print_warning "获取证书列表失败"
+    
+    echo -e "\n${BLUE}acme.sh 配置:${NC}"
+    if [[ -f ~/.acme.sh/account.conf ]]; then
+        grep -E "(ACCOUNT_EMAIL|DEFAULT_CA)" ~/.acme.sh/account.conf || echo "配置文件异常"
+    fi
 }
 
 # 查看服务状态
@@ -648,18 +788,19 @@ show_menu() {
         echo "  5) 修复 Let's Encrypt 设置"
         echo "  6) 重新申请证书"
         echo "  7) 查看证书信息"
+        echo "  8) 修复证书问题"
         echo ""
         echo "  服务管理:"
-        echo "  8) 启动/重启服务"
-        echo "  9) 停止服务"
-        echo " 10) 查看服务状态"
-        echo " 11) 生成客户端配置"
+        echo "  9) 启动/重启服务"
+        echo " 10) 停止服务"
+        echo " 11) 查看服务状态"
+        echo " 12) 生成客户端配置"
         echo ""
-        echo " 12) 卸载 Hysteria 2"
+        echo " 13) 卸载 Hysteria 2"
         echo "  0) 退出"
         echo ""
         
-        read -p "请选择操作 [0-12]: " choice
+        read -p "请选择操作 [0-13]: " choice
         
         case $choice in
             1) full_install; read -p "按回车继续..." ;;
@@ -669,11 +810,12 @@ show_menu() {
             5) fix_letsencrypt; read -p "按回车继续..." ;;
             6) reissue_certificate; read -p "按回车继续..." ;;
             7) show_certificate_info; read -p "按回车继续..." ;;
-            8) systemctl restart hysteria2; show_status; read -p "按回车继续..." ;;
-            9) systemctl stop hysteria2; print_info "服务已停止"; read -p "按回车继续..." ;;
-            10) show_status; read -p "按回车继续..." ;;
-            11) generate_client_config; read -p "按回车继续..." ;;
-            12) uninstall_hysteria2; read -p "按回车继续..." ;;
+            8) fix_certificate_issues; read -p "按回车继续..." ;;
+            9) systemctl restart hysteria2; show_status; read -p "按回车继续..." ;;
+            10) systemctl stop hysteria2; print_info "服务已停止"; read -p "按回车继续..." ;;
+            11) show_status; read -p "按回车继续..." ;;
+            12) generate_client_config; read -p "按回车继续..." ;;
+            13) uninstall_hysteria2; read -p "按回车继续..." ;;
             0) print_info "退出"; exit 0 ;;
             *) print_error "无效选项"; read -p "按回车继续..." ;;
         esac
@@ -688,6 +830,7 @@ main() {
         "cert") show_certificate_info ;;
         "status") show_status ;;
         "reissue") reissue_certificate ;;
+        "fix-cert") fix_certificate_issues ;;
         *) show_menu ;;
     esac
 }

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Hysteria 2 完整安装脚本 - 修复服务依赖问题
-# 改进下载逻辑、服务端bandwidth配置和添加重启选项
+# 改进下载逻辑、服务端bandwidth配置、添加重启选项和ZeroSSL支持
 
 # 颜色定义
 RED='\033[0;31m'
@@ -221,9 +221,205 @@ EOF
     fi
 }
 
-# 申请证书
+# 🆕 选择证书颁发机构
+choose_ca_provider() {
+    echo ""
+    echo -e "${CYAN}选择证书颁发机构 (CA):${NC}"
+    echo "1) Let's Encrypt (默认，推荐)"
+    echo "2) ZeroSSL (支持更多域名类型)" 
+    echo ""
+    
+    local ca_choice
+    read -p "请选择 CA [1-2]: " ca_choice
+    
+    case $ca_choice in
+        1|"")
+            CA_SERVER="letsencrypt"
+            CA_NAME="Let's Encrypt"
+            print_info "选择 CA: $CA_NAME"
+            ;;
+        2)
+            CA_SERVER="zerossl"
+            CA_NAME="ZeroSSL"
+            print_info "选择 CA: $CA_NAME"
+            
+            # ZeroSSL 需要 EAB (External Account Binding)
+            setup_zerossl_eab
+            ;;
+        *)
+            print_warning "无效选择，使用默认: Let's Encrypt"
+            CA_SERVER="letsencrypt"
+            CA_NAME="Let's Encrypt"
+            ;;
+    esac
+    
+    # 设置默认 CA
+    ~/.acme.sh/acme.sh --set-default-ca --server "$CA_SERVER"
+    
+    return 0
+}
+
+# 🆕 配置 ZeroSSL EAB
+setup_zerossl_eab() {
+    print_info "ZeroSSL 需要 EAB 密钥..."
+    echo ""
+    echo -e "${YELLOW}获取 ZeroSSL EAB 密钥步骤:${NC}"
+    echo "1. 访问 https://app.zerossl.com/developer"
+    echo "2. 注册/登录账号"
+    echo "3. 在 Developer 页面获取 EAB Kid 和 EAB HMAC Key"
+    echo ""
+    
+    read -p "是否已获取 EAB 密钥？(y/n): " has_eab
+    if [[ ! "$has_eab" =~ ^[Yy]$ ]]; then
+        print_info "请先获取 EAB 密钥，然后重新运行"
+        return 1
+    fi
+    
+    local eab_kid
+    local eab_hmac_key
+    
+    read -p "请输入 EAB Kid: " eab_kid
+    read -p "请输入 EAB HMAC Key: " eab_hmac_key
+    
+    if [[ -n "$eab_kid" && -n "$eab_hmac_key" ]]; then
+        # 注册 ZeroSSL EAB
+        if ~/.acme.sh/acme.sh --register-account \
+            --server zerossl \
+            --eab-kid "$eab_kid" \
+            --eab-hmac-key "$eab_hmac_key"; then
+            print_success "ZeroSSL EAB 配置成功"
+            return 0
+        else
+            print_error "ZeroSSL EAB 配置失败"
+            return 1
+        fi
+    else
+        print_error "EAB 信息不能为空"
+        return 1
+    fi
+}
+
+# 🆕 检查现有证书
+check_existing_certificate() {
+    local domain="$1"
+    
+    print_info "检查现有证书..."
+    
+    # 检查 acme.sh 记录
+    if [[ -d ~/.acme.sh/"$domain" ]]; then
+        print_warning "发现现有证书记录: $domain"
+        
+        local cert_file="$CERT_DIR/server.crt"
+        if [[ -f "$cert_file" ]]; then
+            # 获取证书信息
+            local issuer=$(openssl x509 -in "$cert_file" -noout -issuer 2>/dev/null | sed 's/.*CN=//' | cut -d',' -f1)
+            local expires=$(openssl x509 -in "$cert_file" -noout -enddate 2>/dev/null | cut -d'=' -f2)
+            local subject=$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | grep -o 'CN=[^,]*' | cut -d'=' -f2)
+            
+            echo -e "${BLUE}当前证书信息:${NC}"
+            echo "  域名: $subject"
+            echo "  颁发者: $issuer"
+            echo "  过期时间: $expires"
+            
+            # 计算剩余天数
+            if command -v date >/dev/null 2>&1; then
+                local expire_date=$(date -d "$expires" +%s 2>/dev/null || echo "0")
+                local current_date=$(date +%s)
+                if [[ "$expire_date" -gt 0 ]]; then
+                    local days_left=$(( (expire_date - current_date) / 86400 ))
+                    echo "  剩余天数: $days_left 天"
+                    
+                    # 如果证书还有30天以上有效期，询问是否继续
+                    if [[ $days_left -gt 30 ]]; then
+                        echo ""
+                        echo -e "${YELLOW}当前证书仍然有效（剩余 $days_left 天），是否：${NC}"
+                        echo "1) 继续使用现有证书"
+                        echo "2) 强制重新申请"
+                        echo "3) 删除现有证书后申请"
+                        echo ""
+                        
+                        local choice
+                        read -p "请选择 [1-3]: " choice
+                        
+                        case $choice in
+                            1)
+                                print_info "使用现有证书"
+                                return 2  # 表示使用现有证书
+                                ;;
+                            2)
+                                print_info "强制重新申请"
+                                return 1  # 表示强制申请
+                                ;;
+                            3)
+                                print_info "删除现有证书"
+                                delete_certificate "$domain"
+                                return 0  # 表示正常申请
+                                ;;
+                            *)
+                                print_info "使用现有证书"
+                                return 2
+                                ;;
+                        esac
+                    fi
+                fi
+            fi
+        fi
+        
+        echo ""
+        echo -e "${YELLOW}发现现有证书配置，是否：${NC}"  
+        echo "1) 更新现有证书"
+        echo "2) 删除后重新申请"
+        echo "3) 取消操作"
+        echo ""
+        
+        local choice
+        read -p "请选择 [1-3]: " choice
+        
+        case $choice in
+            1)
+                print_info "更新现有证书"
+                return 1  # 表示更新证书
+                ;;
+            2)
+                print_info "删除现有证书"
+                delete_certificate "$domain"
+                return 0  # 表示重新申请
+                ;;
+            3)
+                print_info "取消操作"
+                return 3  # 表示取消
+                ;;
+            *)
+                return 1  # 默认更新
+                ;;
+        esac
+    fi
+    
+    return 0  # 没有现有证书
+}
+
+# 🆕 删除证书
+delete_certificate() {
+    local domain="$1"
+    
+    print_info "删除域名 $domain 的证书..."
+    
+    # 删除 acme.sh 记录
+    ~/.acme.sh/acme.sh --remove -d "$domain" 2>/dev/null || true
+    
+    # 删除证书文件目录
+    rm -rf ~/.acme.sh/"$domain" 2>/dev/null || true
+    rm -rf ~/.acme.sh/"$domain"_ecc 2>/dev/null || true
+    
+    # 删除安装的证书文件
+    rm -f "$CERT_DIR/server.crt" "$CERT_DIR/server.key" 2>/dev/null || true
+    
+    print_success "证书删除完成"
+}
+
+# 🆕 修改后的申请证书函数
 request_certificate() {
-    print_step "申请 Let's Encrypt 证书..."
+    print_step "申请 SSL 证书..."
     
     # 获取域名
     local domain=""
@@ -240,6 +436,28 @@ request_certificate() {
     export DOMAIN
     
     print_info "准备申请域名: $DOMAIN"
+    
+    # 检查现有证书
+    check_existing_certificate "$DOMAIN"
+    local cert_status=$?
+    
+    case $cert_status in
+        2)
+            print_success "使用现有有效证书"
+            return 0
+            ;;
+        3)
+            print_info "操作已取消"
+            return 1
+            ;;
+    esac
+    
+    # 确保环境
+    export PATH="$HOME/.acme.sh:$PATH"
+    source ~/.acme.sh/acme.sh.env 2>/dev/null || true
+    
+    # 选择 CA
+    choose_ca_provider || return 1
     
     # 检查域名解析
     print_info "检查域名解析..."
@@ -286,23 +504,26 @@ request_certificate() {
     
     print_success "端口 80 已释放"
     
-    # 确保环境
-    export PATH="$HOME/.acme.sh:$PATH"
-    source ~/.acme.sh/acme.sh.env 2>/dev/null || true
+    # 申请证书参数
+    local issue_params=(
+        "--issue"
+        "-d" "$DOMAIN"
+        "--standalone"
+        "--httpport" "80"
+        "--server" "$CA_SERVER"
+    )
     
-    # 删除可能存在的旧证书记录
-    ~/.acme.sh/acme.sh --remove -d "$DOMAIN" 2>/dev/null || true
+    # 如果是更新现有证书，添加 force 参数
+    if [[ $cert_status -eq 1 ]]; then
+        issue_params+=("--force")
+        print_info "强制更新证书..."
+    else
+        print_info "申请新证书..."
+    fi
     
     # 申请证书
-    print_info "申请证书中..."
-    if ~/.acme.sh/acme.sh --issue \
-        -d "$DOMAIN" \
-        --standalone \
-        --httpport 80 \
-        --server letsencrypt \
-        --accountemail "$(grep ACCOUNT_EMAIL ~/.acme.sh/account.conf | cut -d"'" -f2)" \
-        --force; then
-        
+    print_info "正在申请 $CA_NAME 证书..."
+    if ~/.acme.sh/acme.sh "${issue_params[@]}"; then
         print_success "证书申请成功！"
         
         # 安装证书
@@ -372,6 +593,127 @@ fix_certificate_format() {
     chmod 644 "$CERT_DIR/server.crt"
     
     print_success "证书格式修复完成"
+}
+
+# 🆕 证书管理菜单
+certificate_management() {
+    while true; do
+        clear
+        echo -e "${CYAN}╔══════════════════════════════════════╗${NC}"
+        echo -e "${CYAN}║            证书管理工具              ║${NC}"
+        echo -e "${CYAN}╚══════════════════════════════════════╝${NC}"
+        echo ""
+        echo "1) 🔐 申请新证书"
+        echo "2) 🔄 更新现有证书"
+        echo "3) 🗑️  删除证书"
+        echo "4) 📊 查看证书状态"
+        echo "5) 🔧 修复证书格式"
+        echo "0) 🔙 返回主菜单"
+        echo ""
+        
+        local choice
+        read -p "请选择 [0-5]: " choice
+        
+        case $choice in
+            1)
+                request_certificate
+                ;;
+            2)
+                if [[ -n "$DOMAIN" ]] || [[ -f "$CERT_DIR/server.crt" ]]; then
+                    # 提取域名
+                    local domain="$DOMAIN"
+                    if [[ -z "$domain" && -f "$CERT_DIR/server.crt" ]]; then
+                        domain=$(openssl x509 -in "$CERT_DIR/server.crt" -noout -subject 2>/dev/null | grep -o 'CN=[^,]*' | cut -d'=' -f2)
+                    fi
+                    
+                    if [[ -n "$domain" ]]; then
+                        DOMAIN="$domain"
+                        export DOMAIN
+                        print_info "更新域名 $domain 的证书"
+                        # 强制更新
+                        ~/.acme.sh/acme.sh --renew -d "$domain" --force
+                        if [[ $? -eq 0 ]]; then
+                            print_success "证书更新成功"
+                        else
+                            print_error "证书更新失败"
+                        fi
+                    else
+                        print_error "未找到域名信息"
+                    fi
+                else
+                    print_error "未找到现有证书"
+                fi
+                ;;
+            3)
+                read -p "请输入要删除的域名: " del_domain
+                if [[ -n "$del_domain" ]]; then
+                    read -p "确认删除域名 $del_domain 的证书？(y/n): " confirm
+                    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                        delete_certificate "$del_domain"
+                    fi
+                else
+                    print_error "域名不能为空"
+                fi
+                ;;
+            4)
+                show_certificate_status
+                ;;
+            5)
+                fix_certificate_format
+                ;;
+            0)
+                break
+                ;;
+            *)
+                print_error "无效选项"
+                ;;
+        esac
+        
+        read -p "按回车继续..."
+    done
+}
+
+# 🆕 显示证书状态
+show_certificate_status() {
+    print_info "证书状态检查..."
+    
+    echo -e "${BLUE}已安装证书:${NC}"
+    if [[ -f "$CERT_DIR/server.crt" ]]; then
+        local issuer=$(openssl x509 -in "$CERT_DIR/server.crt" -noout -issuer 2>/dev/null | sed 's/.*CN=//' | cut -d',' -f1)
+        local expires=$(openssl x509 -in "$CERT_DIR/server.crt" -noout -enddate 2>/dev/null | cut -d'=' -f2)
+        local domain_cert=$(openssl x509 -in "$CERT_DIR/server.crt" -noout -subject 2>/dev/null | grep -o 'CN=[^,]*' | cut -d'=' -f2)
+        
+        print_success "✅ 找到证书文件"
+        echo "  域名: $domain_cert"
+        echo "  颁发者: $issuer"  
+        echo "  过期时间: $expires"
+        
+        # 计算剩余天数
+        if command -v date >/dev/null 2>&1; then
+            local expire_date=$(date -d "$expires" +%s 2>/dev/null || echo "0")
+            local current_date=$(date +%s)
+            if [[ "$expire_date" -gt 0 ]]; then
+                local days_left=$(( (expire_date - current_date) / 86400 ))
+                if [[ $days_left -gt 30 ]]; then
+                    echo -e "  剩余天数: ${GREEN}$days_left 天${NC}"
+                elif [[ $days_left -gt 7 ]]; then
+                    echo -e "  剩余天数: ${YELLOW}$days_left 天${NC}"
+                else
+                    echo -e "  剩余天数: ${RED}$days_left 天 (建议更新)${NC}"
+                fi
+            fi
+        fi
+    else
+        print_warning "❌ 未找到证书文件"
+    fi
+    
+    echo ""
+    echo -e "${BLUE}acme.sh 管理的证书:${NC}"
+    if [[ -d ~/.acme.sh ]]; then
+        ~/.acme.sh/acme.sh --list 2>/dev/null || print_warning "未找到 acme.sh 管理的证书"
+    else
+        print_warning "acme.sh 未安装"
+    fi
 }
 
 # 🆕 配置端口跳跃功能
@@ -1224,7 +1566,7 @@ show_menu() {
         echo ""
         echo "1) 🚀 完整安装"
         echo "2) 📦 仅安装程序"
-        echo "3) 🔐 申请证书"
+        echo "3) 🛠️  证书管理"  # 改为证书管理
         echo "4) ⚙️  生成配置"
         echo "5) 🔧 修复证书格式"
         echo "6) ▶️  启动服务"
@@ -1242,7 +1584,7 @@ show_menu() {
         case $choice in
             1) full_install ;;
             2) check_system && install_hysteria2 ;;
-            3) install_acme_clean && request_certificate ;;
+            3) certificate_management ;;  # 改为证书管理菜单
             4) generate_config ;;
             5) fix_certificate_format ;;
             6) start_service ;;
@@ -1286,7 +1628,7 @@ main() {
     case "${1:-menu}" in
         "install"|"i") full_install ;;
         "status"|"s") show_status ;;
-        "cert"|"c") install_acme_clean && request_certificate ;;
+        "cert"|"c") certificate_management ;;
         "fix") fix_certificate_format ;;
         "hopping"|"h") setup_port_hopping ;;
         "restart"|"r") restart_service ;;
@@ -1295,3 +1637,4 @@ main() {
 }
 
 main "$@"
+
